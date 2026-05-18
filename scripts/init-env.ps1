@@ -44,6 +44,20 @@ function ConvertTo-YamlDoubleQuoted {
     return '"' + ($Value -replace '\\', '\\' -replace '"', '\"') + '"'
 }
 
+function Expand-PathList {
+    param([string[]]$Values)
+    $Expanded = @()
+    foreach ($Value in $Values) {
+        foreach ($Item in ($Value -split ",")) {
+            $Trimmed = $Item.Trim()
+            if ($Trimmed) {
+                $Expanded += $Trimmed
+            }
+        }
+    }
+    return $Expanded
+}
+
 if ($SourceDir) {
     $SourceDirs += $SourceDir
 }
@@ -51,40 +65,35 @@ if ($OutputDir) {
     $OutputDirs += $OutputDir
 }
 
+$SourceDirs = Expand-PathList -Values $SourceDirs
+$OutputDirs = Expand-PathList -Values $OutputDirs
+
 while ($SourceDirs.Count -eq 0) {
     $InputValue = Read-Host "Enter the full audio/video source folder path"
     if ($InputValue) {
         $SourceDirs += $InputValue
     }
-    $OutputValue = Read-Host "Enter the full transcript output folder path"
-    if ($OutputValue) {
-        $OutputDirs += $OutputValue
-    }
 
     while ($true) {
-        $More = Read-Host "Add another source/output pair? [y/N]"
+        $More = Read-Host "Add another source folder? [y/N]"
         if ($More -notmatch "^(y|Y)") {
             break
         }
         $InputValue = Read-Host "Enter the full audio/video source folder path"
-        $OutputValue = Read-Host "Enter the full transcript output folder path"
         if ($InputValue) {
             $SourceDirs += $InputValue
-        }
-        if ($OutputValue) {
-            $OutputDirs += $OutputValue
         }
     }
 }
 
-if ($SourceDirs.Count -ne $OutputDirs.Count) {
-    if ($SourceDirs.Count -eq 1 -and $OutputDirs.Count -eq 0) {
+if ($OutputDirs.Count -eq 0) {
+    for ($Index = 0; $Index -lt $SourceDirs.Count; $Index++) {
         $OutputDirs += Join-Path $ProjectRoot "output"
     }
 }
 
 if ($SourceDirs.Count -ne $OutputDirs.Count) {
-    throw "SourceDirs and OutputDirs must contain the same number of paths."
+    throw "OutputDirs is optional, but if provided it must contain the same number of paths as SourceDirs."
 }
 if ($SourceDirs.Count -eq 0) {
     throw "At least one source/output pair is required."

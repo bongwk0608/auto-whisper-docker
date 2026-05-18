@@ -8,7 +8,7 @@ OUTPUT_FORMAT="all"
 CUDA="false"
 
 usage() {
-  echo "Usage: $0 --source-dir /path/to/audio-folder --output-dir /path/to/transcripts [--source-dir ... --output-dir ...] [--model base] [--output-format all] [--cuda]"
+  echo "Usage: $0 --source-dir /path/to/audio-folder [--source-dir ...] [--output-dir /path/to/transcripts ...] [--model base] [--output-format all] [--cuda]"
 }
 
 append_value() {
@@ -87,12 +87,9 @@ if [ -z "$SOURCE_DIRS" ]; then
   while :; do
     printf "Enter the full audio/video source folder path: "
     IFS= read -r SOURCE_DIR
-    printf "Enter the full transcript output folder path: "
-    IFS= read -r OUTPUT_DIR
     SOURCE_DIRS="$(append_value "$SOURCE_DIRS" "$SOURCE_DIR")"
-    OUTPUT_DIRS="$(append_value "$OUTPUT_DIRS" "$OUTPUT_DIR")"
 
-    printf "Add another source/output pair? [y/N]: "
+    printf "Add another source folder? [y/N]: "
     IFS= read -r MORE
     case "$MORE" in
       y|Y|yes|YES) ;;
@@ -103,12 +100,16 @@ fi
 
 SOURCE_COUNT="$(count_values "$SOURCE_DIRS")"
 OUTPUT_COUNT="$(count_values "$OUTPUT_DIRS")"
-if [ "$SOURCE_COUNT" -eq 1 ] && [ "$OUTPUT_COUNT" -eq 0 ]; then
-  OUTPUT_DIRS="$PROJECT_ROOT/output"
-  OUTPUT_COUNT=1
+if [ "$OUTPUT_COUNT" -eq 0 ]; then
+  INDEX=1
+  while [ "$INDEX" -le "$SOURCE_COUNT" ]; do
+    OUTPUT_DIRS="$(append_value "$OUTPUT_DIRS" "$PROJECT_ROOT/output")"
+    INDEX=$((INDEX + 1))
+  done
+  OUTPUT_COUNT="$SOURCE_COUNT"
 fi
 if [ "$SOURCE_COUNT" -ne "$OUTPUT_COUNT" ]; then
-  echo "Source and output folder counts must match." >&2
+  echo "Output folders are optional, but if provided their count must match source folders." >&2
   exit 1
 fi
 if [ "$SOURCE_COUNT" -eq 0 ]; then
