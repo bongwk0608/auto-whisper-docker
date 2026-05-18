@@ -1,19 +1,58 @@
 #!/usr/bin/env sh
 set -eu
 
-SOURCE_DIR=""
+SOURCE_DIRS=""
+OUTPUT_DIRS=""
 MODEL="base"
 OUTPUT_FORMAT="all"
 CUDA="false"
 
 usage() {
-  echo "Usage: $0 --source-dir /path/to/audio-folder [--model base] [--output-format all] [--cuda]"
+  echo "Usage: $0 --source-dir /path/to/audio-folder --output-dir /path/to/transcripts [--source-dir ... --output-dir ...] [--model base] [--output-format all] [--cuda]"
+}
+
+append_value() {
+  if [ -z "$1" ]; then
+    printf '%s' "$2"
+  else
+    printf '%s;%s' "$1" "$2"
+  fi
+}
+
+count_values() {
+  if [ -z "$1" ]; then
+    echo 0
+  else
+    awk -F';' '{print NF}' <<EOF
+$1
+EOF
+  fi
+}
+
+value_at() {
+  INDEX="$1"
+  VALUES="$2"
+  awk -v index="$INDEX" -F';' '{print $index}' <<EOF
+$VALUES
+EOF
+}
+
+json_escape() {
+  printf '%s' "$1" | sed 's/\\/\\\\/g; s/"/\\"/g'
+}
+
+yaml_quote() {
+  printf '"%s"' "$(json_escape "$1")"
 }
 
 while [ "$#" -gt 0 ]; do
   case "$1" in
     --source-dir)
-      SOURCE_DIR="${2:-}"
+      SOURCE_DIRS="$(append_value "$SOURCE_DIRS" "${2:-}")"
+      shift 2
+      ;;
+    --output-dir)
+      OUTPUT_DIRS="$(append_value "$OUTPUT_DIRS" "${2:-}")"
       shift 2
       ;;
     --model)
@@ -40,19 +79,63 @@ while [ "$#" -gt 0 ]; do
   esac
 done
 
-if [ -z "$SOURCE_DIR" ]; then
-  printf "Enter the full audio/video source folder path: "
-  IFS= read -r SOURCE_DIR
+PROJECT_ROOT="$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)"
+ENV_PATH="$PROJECT_ROOT/.env"
+OVERRIDE_PATH="$PROJECT_ROOT/docker-compose.override.yml"
+
+if [ -z "$SOURCE_DIRS" ]; then
+  while :; do
+    printf "Enter the full audio/video source folder path: "
+    IFS= read -r SOURCE_DIR
+    printf "Enter the full transcript output folder path: "
+    IFS= read -r OUTPUT_DIR
+    SOURCE_DIRS="$(append_value "$SOURCE_DIRS" "$SOURCE_DIR")"
+    OUTPUT_DIRS="$(append_value "$OUTPUT_DIRS" "$OUTPUT_DIR")"
+
+    printf "Add another source/output pair? [y/N]: "
+    IFS= read -r MORE
+    case "$MORE" in
+      y|Y|yes|YES) ;;
+      *) break ;;
+    esac
+  done
 fi
 
-if [ ! -d "$SOURCE_DIR" ]; then
-  echo "Source directory does not exist or is not a folder: $SOURCE_DIR" >&2
+SOURCE_COUNT="$(count_values "$SOURCE_DIRS")"
+OUTPUT_COUNT="$(count_values "$OUTPUT_DIRS")"
+if [ "$SOURCE_COUNT" -eq 1 ] && [ "$OUTPUT_COUNT" -eq 0 ]; then
+  OUTPUT_DIRS="$PROJECT_ROOT/output"
+  OUTPUT_COUNT=1
+fi
+if [ "$SOURCE_COUNT" -ne "$OUTPUT_COUNT" ]; then
+  echo "Source and output folder counts must match." >&2
+  exit 1
+fi
+if [ "$SOURCE_COUNT" -eq 0 ]; then
+  echo "At least one source/output pair is required." >&2
   exit 1
 fi
 
-PROJECT_ROOT="$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)"
-ENV_PATH="$PROJECT_ROOT/.env"
-RESOLVED_SOURCE_DIR="$(CDPATH= cd -- "$SOURCE_DIR" && pwd)"
+RESOLVED_SOURCE_DIRS=""
+RESOLVED_OUTPUT_DIRS=""
+INDEX=1
+while [ "$INDEX" -le "$SOURCE_COUNT" ]; do
+  SOURCE_DIR="$(value_at "$INDEX" "$SOURCE_DIRS")"
+  OUTPUT_DIR="$(value_at "$INDEX" "$OUTPUT_DIRS")"
+
+  if [ ! -d "$SOURCE_DIR" ]; then
+    echo "Source directory does not exist or is not a folder: $SOURCE_DIR" >&2
+    exit 1
+  fi
+  mkdir -p "$OUTPUT_DIR"
+
+  RESOLVED_SOURCE="$(CDPATH= cd -- "$SOURCE_DIR" && pwd)"
+  RESOLVED_OUTPUT="$(CDPATH= cd -- "$OUTPUT_DIR" && pwd)"
+  RESOLVED_SOURCE_DIRS="$(append_value "$RESOLVED_SOURCE_DIRS" "$RESOLVED_SOURCE")"
+  RESOLVED_OUTPUT_DIRS="$(append_value "$RESOLVED_OUTPUT_DIRS" "$RESOLVED_OUTPUT")"
+  INDEX=$((INDEX + 1))
+done
+
 DEVICE="cpu"
 FP16="false"
 NVIDIA_VISIBLE_DEVICES="void"
@@ -71,8 +154,21 @@ if [ "$CUDA" = "true" ]; then
   NVIDIA_VISIBLE_DEVICES="all"
 fi
 
+INPUT_OUTPUT_PAIRS="["
+INDEX=1
+while [ "$INDEX" -le "$SOURCE_COUNT" ]; do
+  if [ "$INDEX" -gt 1 ]; then
+    INPUT_OUTPUT_PAIRS="${INPUT_OUTPUT_PAIRS},"
+  fi
+  INPUT_OUTPUT_PAIRS="${INPUT_OUTPUT_PAIRS}{\"input\":\"/inputs/input-$(printf '%03d' "$INDEX")\",\"output\":\"/outputs/output-$(printf '%03d' "$INDEX")\"}"
+  INDEX=$((INDEX + 1))
+done
+INPUT_OUTPUT_PAIRS="${INPUT_OUTPUT_PAIRS}]"
+
 cat > "$ENV_PATH" <<EOF
-SOURCE_DIR=$RESOLVED_SOURCE_DIR
+SOURCE_DIRS=$RESOLVED_SOURCE_DIRS
+OUTPUT_DIRS=$RESOLVED_OUTPUT_DIRS
+INPUT_OUTPUT_PAIRS=$INPUT_OUTPUT_PAIRS
 WHISPER_MODEL=$MODEL
 WHISPER_OUTPUT_FORMAT=$OUTPUT_FORMAT
 WHISPER_LANGUAGE=
@@ -87,5 +183,47 @@ NVIDIA_VISIBLE_DEVICES=$NVIDIA_VISIBLE_DEVICES
 NVIDIA_DRIVER_CAPABILITIES=compute,utility
 EOF
 
+{
+  echo "services:"
+  echo "  whisper:"
+  echo "    volumes:"
+  INDEX=1
+  while [ "$INDEX" -le "$SOURCE_COUNT" ]; do
+    SOURCE_DIR="$(value_at "$INDEX" "$RESOLVED_SOURCE_DIRS")"
+    echo "      - type: bind"
+    echo "        source: $(yaml_quote "$SOURCE_DIR")"
+    echo "        target: /inputs/input-$(printf '%03d' "$INDEX")"
+    INDEX=$((INDEX + 1))
+  done
+  INDEX=1
+  while [ "$INDEX" -le "$OUTPUT_COUNT" ]; do
+    OUTPUT_DIR="$(value_at "$INDEX" "$RESOLVED_OUTPUT_DIRS")"
+    echo "      - type: bind"
+    echo "        source: $(yaml_quote "$OUTPUT_DIR")"
+    echo "        target: /outputs/output-$(printf '%03d' "$INDEX")"
+    INDEX=$((INDEX + 1))
+  done
+  echo "  whisper-cuda:"
+  echo "    volumes:"
+  INDEX=1
+  while [ "$INDEX" -le "$SOURCE_COUNT" ]; do
+    SOURCE_DIR="$(value_at "$INDEX" "$RESOLVED_SOURCE_DIRS")"
+    echo "      - type: bind"
+    echo "        source: $(yaml_quote "$SOURCE_DIR")"
+    echo "        target: /inputs/input-$(printf '%03d' "$INDEX")"
+    INDEX=$((INDEX + 1))
+  done
+  INDEX=1
+  while [ "$INDEX" -le "$OUTPUT_COUNT" ]; do
+    OUTPUT_DIR="$(value_at "$INDEX" "$RESOLVED_OUTPUT_DIRS")"
+    echo "      - type: bind"
+    echo "        source: $(yaml_quote "$OUTPUT_DIR")"
+    echo "        target: /outputs/output-$(printf '%03d' "$INDEX")"
+    INDEX=$((INDEX + 1))
+  done
+} > "$OVERRIDE_PATH"
+
 echo "Wrote $ENV_PATH"
+echo "Wrote $OVERRIDE_PATH"
+echo "Configured $SOURCE_COUNT source/output pair(s)"
 echo "Selected WHISPER_DEVICE=$DEVICE"

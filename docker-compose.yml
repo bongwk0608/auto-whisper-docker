@@ -1,11 +1,5 @@
 x-whisper-volumes: &whisper-volumes
   - type: bind
-    source: ${SOURCE_DIR}
-    target: /input
-  - type: bind
-    source: ./output
-    target: /project-output
-  - type: bind
     source: ./state
     target: /state
   - type: bind
@@ -13,8 +7,9 @@ x-whisper-volumes: &whisper-volumes
     target: /root/.cache/whisper
 
 x-whisper-environment: &whisper-environment
-  INPUT_DIR: /input
-  PROJECT_OUTPUT_DIR: /project-output
+  INPUT_OUTPUT_PAIRS: ${INPUT_OUTPUT_PAIRS:-}
+  INPUT_DIR: ${INPUT_DIR:-/input}
+  PROJECT_OUTPUT_DIR: ${PROJECT_OUTPUT_DIR:-/project-output}
   STATE_DIR: /state
   WHISPER_MODEL: ${WHISPER_MODEL:-base}
   WHISPER_OUTPUT_FORMAT: ${WHISPER_OUTPUT_FORMAT:-all}

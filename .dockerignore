@@ -3,6 +3,7 @@
 .env
 .env.*
 !.env.example
+docker-compose.override.yml
 output/
 state/
 test_input/
