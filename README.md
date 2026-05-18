@@ -38,6 +38,44 @@ sh ./scripts/init-env.sh --source-dir /path/to/audio-folder
 
 The helper writes both `.env` and `docker-compose.override.yml`. The override file contains local folder bind mounts and is ignored by Git.
 
+## Windows WSL Docker Engine Setup
+
+Use this path when Docker Engine is installed inside your WSL distro and you are not using Docker Desktop for Windows.
+
+Run Docker commands from the WSL shell. For best performance during long transcriptions, keep this repo under the WSL filesystem, such as `~/projects/auto_whisper`, instead of running it from `/mnt/c` or `/mnt/d`.
+
+Confirm Docker, Compose, and GPU access inside WSL:
+
+```sh
+docker info
+docker compose version
+nvidia-smi
+docker run --rm --gpus all nvidia/cuda:12.4.1-base-ubuntu22.04 nvidia-smi
+```
+
+Generate WSL-native `.env` and `docker-compose.override.yml` files from inside WSL. If your source media is still on Windows drive `D:`, use the `/mnt/d/...` path:
+
+```sh
+sh ./scripts/init-env.sh --source-dir /mnt/d/auto_whisper/test_input --cuda --model medium --output-format all
+```
+
+Validate and run the CUDA service:
+
+```sh
+docker compose --profile cuda config
+docker compose --profile cuda build whisper-cuda
+docker compose --profile cuda run --rm whisper-cuda python /app/download_model.py
+docker compose --profile cuda up whisper-cuda
+```
+
+For CPU fallback, regenerate without `--cuda`, or set `WHISPER_DEVICE=cpu`, `WHISPER_FP16=false`, and `NVIDIA_VISIBLE_DEVICES=void`, then run:
+
+```sh
+docker compose up whisper
+```
+
+Keep `models/`, `output/`, and `state/` local to the WSL repo when possible. If you already downloaded models on Windows, you can copy the `.pt` files into the WSL repo's `models/` directory.
+
 To configure multiple input folders, pass each source folder. All transcripts are written under this project folder's ignored `output/` directory:
 
 ```powershell
@@ -174,6 +212,8 @@ Run transcription with CUDA:
 docker compose --profile cuda up whisper-cuda
 ```
 
+For CUDA runs, keep the `whisper-cuda` service name in the command. Plain `docker compose up` starts the default CPU service and may build the CPU image.
+
 To rebuild and run:
 
 ```sh
@@ -269,10 +309,20 @@ swap=24GB
 localhostForwarding=true
 ```
 
-A matching template is included at `.wslconfig.example`. If you copy it to `$env:USERPROFILE\.wslconfig`, restart WSL and Docker Desktop:
+A matching template is included at `.wslconfig.example`. If you copy it to `$env:USERPROFILE\.wslconfig`, restart WSL. If you use Docker Desktop, restart Docker Desktop too:
 
 ```powershell
 wsl --shutdown
+```
+
+When you use Docker Engine inside WSL without Docker Desktop, restart WSL and then start your WSL Docker service again:
+
+```powershell
+wsl --shutdown
+```
+
+```sh
+sudo service docker start
 ```
 
 ## Troubleshooting
