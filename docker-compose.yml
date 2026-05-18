@@ -1,0 +1,63 @@
+x-whisper-volumes: &whisper-volumes
+  - type: bind
+    source: ${SOURCE_DIR}
+    target: /input
+  - type: bind
+    source: ./output
+    target: /project-output
+  - type: bind
+    source: ./state
+    target: /state
+  - type: bind
+    source: ./models
+    target: /root/.cache/whisper
+
+x-whisper-environment: &whisper-environment
+  INPUT_DIR: /input
+  PROJECT_OUTPUT_DIR: /project-output
+  STATE_DIR: /state
+  WHISPER_MODEL: ${WHISPER_MODEL:-base}
+  WHISPER_OUTPUT_FORMAT: ${WHISPER_OUTPUT_FORMAT:-all}
+  WHISPER_LANGUAGE: ${WHISPER_LANGUAGE:-}
+  WHISPER_TASK: ${WHISPER_TASK:-transcribe}
+  WHISPER_DOWNLOAD_DEVICE: ${WHISPER_DOWNLOAD_DEVICE:-cpu}
+  WHISPER_CONDITION_ON_PREVIOUS_TEXT: ${WHISPER_CONDITION_ON_PREVIOUS_TEXT:-true}
+  WHISPER_VERBOSE: ${WHISPER_VERBOSE:-false}
+  SUPPORTED_EXTENSIONS: ${SUPPORTED_EXTENSIONS:-.mp3,.wav,.m4a,.mp4,.mov,.mkv,.webm,.flac,.ogg,.aac,.wma}
+
+services:
+  whisper:
+    build:
+      context: .
+      dockerfile: Dockerfile.cpu
+    image: auto-whisper:cpu
+    volumes: *whisper-volumes
+    environment:
+      <<: *whisper-environment
+      WHISPER_DEVICE: cpu
+      WHISPER_FP16: "false"
+    stdin_open: true
+    tty: true
+
+  whisper-cuda:
+    profiles: ["cuda"]
+    build:
+      context: .
+      dockerfile: Dockerfile.cuda
+    image: auto-whisper:cuda
+    volumes: *whisper-volumes
+    environment:
+      <<: *whisper-environment
+      WHISPER_DEVICE: ${WHISPER_DEVICE:-auto}
+      WHISPER_FP16: ${WHISPER_FP16:-auto}
+      NVIDIA_VISIBLE_DEVICES: ${NVIDIA_VISIBLE_DEVICES:-all}
+      NVIDIA_DRIVER_CAPABILITIES: ${NVIDIA_DRIVER_CAPABILITIES:-compute,utility}
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+    stdin_open: true
+    tty: true

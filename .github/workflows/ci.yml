@@ -1,0 +1,20 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Compile Python
+        run: python -m py_compile scripts/transcribe.py scripts/download_model.py
+      - name: Validate CPU Compose
+        run: docker compose --env-file .env.example.cpu config
+      - name: Validate CUDA Compose Profile
+        run: docker compose --env-file .env.example.cuda --profile cuda config
