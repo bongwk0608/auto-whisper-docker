@@ -32,7 +32,7 @@ EOF
 value_at() {
   INDEX="$1"
   VALUES="$2"
-  awk -v index="$INDEX" -F';' '{print $index}' <<EOF
+  awk -v field_index="$INDEX" -F';' '{print $field_index}' <<EOF
 $VALUES
 EOF
 }
