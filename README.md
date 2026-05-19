@@ -76,17 +76,40 @@ docker compose up whisper
 
 Keep `models/`, `output/`, and `state/` local to the WSL repo when possible. If you already downloaded models on Windows, you can copy the `.pt` files into the WSL repo's `models/` directory.
 
-To configure multiple input folders, pass each source folder. All transcripts are written under this project folder's ignored `output/` directory:
+## Adding Or Changing Input Folders
+
+Add or change folders by rerunning the setup helper. The helper updates both `.env` and `docker-compose.override.yml`; keep those files in sync because `.env` names the input/output pairs and the override file creates the Docker bind mounts.
+
+From Windows PowerShell with Docker Desktop, use Windows paths:
 
 ```powershell
 .\scripts\init-env.ps1 -SourceDirs "D:\audio-a,D:\audio-b"
 ```
 
+From WSL, use WSL paths. Windows drive `D:\...` becomes `/mnt/d/...`, and `C:\Users\USER\Downloads` becomes `/mnt/c/Users/USER/Downloads`:
+
 ```sh
-sh ./scripts/init-env.sh --source-dir /audio-a --source-dir /audio-b
+sh ./scripts/init-env.sh \
+  --source-dir "/mnt/d/WOC7014 Framework – Based Software Design and Development" \
+  --source-dir "/mnt/c/Users/USER/Downloads" \
+  --model medium \
+  --output-format all \
+  --cuda
 ```
 
 The source folders should normally live outside this repo. Transcripts are written only under this repo's `output/` folder by default. Advanced users can still pass `-OutputDirs` or `--output-dir` values if they want custom output roots.
+
+Validate the generated Compose configuration after changing folders:
+
+```sh
+docker compose --profile cuda config
+```
+
+For CPU-only setup, omit `--cuda` and validate with:
+
+```sh
+docker compose config
+```
 
 You can also create `.env` manually:
 
@@ -219,6 +242,30 @@ To rebuild and run:
 ```sh
 docker compose --profile cuda up --build whisper-cuda
 ```
+
+### CUDA Command Cheat Sheet
+
+You do not need to run every CUDA command every time.
+
+Run this after Dockerfile or dependency changes:
+
+```sh
+docker compose --profile cuda build whisper-cuda
+```
+
+Run this the first time you use a model, or after changing `WHISPER_MODEL`:
+
+```sh
+docker compose --profile cuda run --rm whisper-cuda python /app/download_model.py
+```
+
+Run this for normal transcription launches:
+
+```sh
+docker compose --profile cuda up whisper-cuda
+```
+
+Changing input folders in `.env` and `docker-compose.override.yml` does not require a rebuild. Run the setup helper again, validate with `docker compose --profile cuda config`, then run `docker compose --profile cuda up whisper-cuda`.
 
 ## Output
 
