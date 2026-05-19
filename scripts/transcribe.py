@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import shutil
 import sys
 import tempfile
 import traceback
@@ -258,7 +259,7 @@ def write_outputs(result: dict[str, Any], source_path: Path, project_base: Path,
         project_outputs = expected_outputs(project_base_no_suffix, formats)
         for temp_output, project_output in zip(temp_outputs, project_outputs):
             project_output.parent.mkdir(parents=True, exist_ok=True)
-            temp_output.replace(project_output)
+            shutil.move(str(temp_output), str(project_output))
 
     return project_outputs
 
