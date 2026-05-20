@@ -50,6 +50,28 @@ class TranscribeLogicTests(unittest.TestCase):
 
             self.assertRegex(run_id, r"^Audio_Folder_[^/\\]*_created-\d{14}_modified-\d{14}$")
 
+    def test_run_id_can_use_host_display_name(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="input-001") as temp_dir:
+            run_id = transcribe.make_run_id(Path(temp_dir), "Downloads")
+
+            self.assertRegex(run_id, r"^Downloads_created-\d{14}_modified-\d{14}$")
+
+    def test_source_display_name_prefers_host_input_basename(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="input-001") as temp_dir:
+            display_name = transcribe.source_display_name(Path(temp_dir), "/mnt/y/Class Recording/UM CS")
+
+            self.assertEqual(display_name, "UM CS")
+
+    def test_source_display_name_falls_back_to_container_folder(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="input-001") as temp_dir:
+            display_name = transcribe.source_display_name(Path(temp_dir), "")
+
+            self.assertTrue(display_name.startswith("input-001"))
+
+    def test_safe_folder_name_sanitizes_host_display_name(self) -> None:
+        self.assertEqual(transcribe.safe_folder_name("UM CS"), "UM_CS")
+        self.assertEqual(transcribe.safe_folder_name("Class Recording: UM/CS"), "Class_Recording__UM_CS")
+
     def test_prepare_pair_preserves_nested_output_path(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
@@ -86,6 +108,35 @@ class TranscribeLogicTests(unittest.TestCase):
             self.assertEqual(state["active_run_ids"]["pair-001"], "previous_active_run")
             self.assertIsNotNone(prepared.mapping)
             self.assertEqual(prepared.mapping["run_id"], "previous_active_run")
+
+    def test_prepare_pair_uses_host_folder_name_for_new_run(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            input_dir = root / "input-001"
+            output_dir = root / "output"
+            input_dir.mkdir()
+            (input_dir / "audio.mp3").write_bytes(b"audio")
+
+            pair = transcribe.InputOutputPair("pair-001", input_dir, output_dir)
+            state = {"version": 1, "runs": {}, "files": {}}
+            prepared = transcribe.prepare_pair(
+                pair,
+                0,
+                state,
+                ["txt"],
+                [".mp3"],
+                {"model": "base"},
+                ["/mnt/c/Users/USER/Downloads"],
+                ["/mnt/d/auto_whisper/output"],
+                "metadata",
+                False,
+            )
+
+            run_id = state["active_run_ids"]["pair-001"]
+            self.assertRegex(run_id, r"^Downloads_created-\d{14}_modified-\d{14}$")
+            self.assertEqual(prepared.mapping["source_folder_name"], "Downloads")
+            self.assertEqual(prepared.mapping["run_id"], run_id)
+            self.assertEqual(Path(prepared.mapping["run_output_dir"]).name, run_id)
 
     def test_scan_files_recurses_multiple_levels_and_ignores_unsupported_files(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -130,6 +181,7 @@ class TranscribeLogicTests(unittest.TestCase):
             self.assertFalse(mappings[1]["local_staging"])
             self.assertEqual(mappings[0]["supported_file_count"], 1)
             self.assertEqual(mappings[1]["supported_file_count"], 1)
+            self.assertEqual(mappings[1]["source_folder_name"], "UM CS")
             self.assertRegex(mappings[1]["run_id"], r"^UM_CS_created-\d{14}_modified-\d{14}$")
             self.assertEqual(prepared_b.pending[0].output_media_path.relative_to(output_root / mappings[1]["run_id"]).as_posix(), "course/week1/b.wav")
 

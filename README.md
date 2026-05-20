@@ -334,6 +334,8 @@ For each source folder, transcript files are written into:
 output/<source_folder_name>_created-<YYYYMMDDHHMMSS>_modified-<YYYYMMDDHHMMSS>/
 ```
 
+When setup scripts provide `SOURCE_DIRS`, `<source_folder_name>` comes from the real host input folder name, not the Docker mount alias. For example, `/mnt/c/Users/USER/Downloads` writes under `Downloads_created-..._modified-...`, and `/mnt/y/Class Recording/UM CS` writes under `UM_CS_created-..._modified-...`. If host paths are not available, Auto Whisper falls back to the container input folder name.
+
 Relative subfolders are preserved in that output folder. For example, a source file at `course/week1/audio.mp3` writes transcript files under `course/week1/` inside that source folder's timestamped output folder. Transcript sidecars are not written beside the original media files.
 
 The output root also contains mapping manifests that show which input folder maps to which timestamped output folder:

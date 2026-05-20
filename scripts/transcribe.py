@@ -190,8 +190,23 @@ def source_folder_name(input_dir: Path) -> str:
         return input_dir.name or "input"
 
 
-def make_run_id(input_dir: Path) -> str:
-    safe_name = "".join(ch if ch.isalnum() or ch in "._-" else "_" for ch in source_folder_name(input_dir))
+def folder_name_from_path(value: str) -> str:
+    normalized = value.strip().replace("\\", "/").rstrip("/")
+    if not normalized:
+        return ""
+    return normalized.rsplit("/", 1)[-1] or ""
+
+
+def safe_folder_name(value: str) -> str:
+    return "".join(ch if ch.isalnum() or ch in "._-" else "_" for ch in value)
+
+
+def source_display_name(input_dir: Path, host_input_dir: str = "") -> str:
+    return folder_name_from_path(host_input_dir) or source_folder_name(input_dir)
+
+
+def make_run_id(input_dir: Path, display_name: str = "") -> str:
+    safe_name = safe_folder_name(display_name or source_folder_name(input_dir))
     return f"{safe_name}{source_timestamp_suffix(input_dir)}"
 
 
@@ -345,6 +360,7 @@ def host_path_for_pair(values: list[str], index: int) -> str:
 def build_mapping_record(
     pair: InputOutputPair,
     pair_index: int,
+    display_name: str,
     run_id: str,
     run_output_dir: Path,
     files_found: int,
@@ -363,7 +379,7 @@ def build_mapping_record(
         "container_output_root": str(pair.output_dir),
         "run_id": run_id,
         "run_output_dir": str(run_output_dir),
-        "source_folder_name": source_folder_name(pair.input_dir),
+        "source_folder_name": display_name,
         "input_created_timestamp": created,
         "input_modified_timestamp": modified,
         "formats": ",".join(formats),
@@ -427,10 +443,12 @@ def prepare_pair(
 
     active_run_ids = state.setdefault("active_run_ids", {})
     active_run_id = active_run_ids.get(pair.id)
+    host_input_dir = host_path_for_pair(host_input_dirs, pair_index)
+    display_name = source_display_name(pair.input_dir, host_input_dir)
     if active_run_id and (pair.output_dir / active_run_id).exists():
         run_id = active_run_id
     else:
-        run_id = make_run_id(pair.input_dir)
+        run_id = make_run_id(pair.input_dir, display_name)
         active_run_ids[pair.id] = run_id
 
     run_output_dir = pair.output_dir / run_id
@@ -447,6 +465,7 @@ def prepare_pair(
     mapping = build_mapping_record(
         pair,
         pair_index,
+        display_name,
         run_id,
         run_output_dir,
         len(files),
