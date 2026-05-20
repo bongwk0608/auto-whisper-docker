@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import csv
 import hashlib
 import json
 import os
@@ -7,9 +8,10 @@ import shutil
 import sys
 import tempfile
 import traceback
+from contextlib import contextmanager
 from datetime import datetime
 from pathlib import Path
-from typing import Any, NamedTuple
+from typing import Any, Iterator, NamedTuple
 
 import torch
 import whisper
@@ -36,12 +38,22 @@ class PendingFile(NamedTuple):
     fingerprint: dict[str, Any]
 
 
+class PreparedPair(NamedTuple):
+    skipped: int
+    pending: list[PendingFile]
+    mapping: dict[str, Any] | None
+
+
 def env(name: str, default: str = "") -> str:
     return os.environ.get(name, default).strip()
 
 
 def parse_list(value: str) -> list[str]:
     return [item.strip().lower() for item in value.split(",") if item.strip()]
+
+
+def parse_path_list(value: str) -> list[str]:
+    return [item.strip() for item in value.split(";") if item.strip()]
 
 
 def parse_formats(value: str) -> list[str]:
@@ -55,6 +67,13 @@ def parse_formats(value: str) -> list[str]:
     if not formats:
         raise ValueError("WHISPER_OUTPUT_FORMAT must be one of txt,json,tsv,srt,vtt,all")
     return formats
+
+
+def parse_fingerprint_mode(value: str) -> str:
+    value = value.lower()
+    if value not in {"metadata", "sha256"}:
+        raise ValueError("FINGERPRINT_MODE must be metadata or sha256")
+    return value
 
 
 def parse_input_output_pairs() -> list[InputOutputPair]:
@@ -105,17 +124,23 @@ def validate_pairs(pairs: list[InputOutputPair]) -> None:
             raise FileNotFoundError(f"Output path is not a directory: {pair.output_dir}")
 
 
-def file_fingerprint(path: Path) -> dict[str, Any]:
+def file_fingerprint(path: Path, mode: str) -> dict[str, Any]:
     stat = path.stat()
+    fingerprint: dict[str, Any] = {
+        "size": stat.st_size,
+        "mtime_ns": stat.st_mtime_ns,
+    }
+    if mode == "metadata":
+        return fingerprint
+    if mode != "sha256":
+        raise ValueError("FINGERPRINT_MODE must be metadata or sha256")
+
     digest = hashlib.sha256()
     with path.open("rb") as handle:
         for chunk in iter(lambda: handle.read(1024 * 1024), b""):
             digest.update(chunk)
-    return {
-        "size": stat.st_size,
-        "mtime_ns": stat.st_mtime_ns,
-        "sha256": digest.hexdigest(),
-    }
+    fingerprint["sha256"] = digest.hexdigest()
+    return fingerprint
 
 
 def atomic_write_json(path: Path, data: dict[str, Any]) -> None:
@@ -123,6 +148,17 @@ def atomic_write_json(path: Path, data: dict[str, Any]) -> None:
     with tempfile.NamedTemporaryFile("w", encoding="utf-8", dir=path.parent, delete=False) as handle:
         json.dump(data, handle, indent=2, sort_keys=True)
         handle.write("\n")
+        temp_name = handle.name
+    Path(temp_name).replace(path)
+
+
+def atomic_write_csv(path: Path, rows: list[dict[str, Any]], fieldnames: list[str]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with tempfile.NamedTemporaryFile("w", encoding="utf-8", newline="", dir=path.parent, delete=False) as handle:
+        writer = csv.DictWriter(handle, fieldnames=fieldnames, extrasaction="ignore")
+        writer.writeheader()
+        for row in rows:
+            writer.writerow({field: row.get(field, "") for field in fieldnames})
         temp_name = handle.name
     Path(temp_name).replace(path)
 
@@ -171,11 +207,14 @@ def format_file_timestamp(timestamp: float) -> str:
     return datetime.fromtimestamp(timestamp).strftime("%Y%m%d%H%M%S")
 
 
-def source_timestamp_suffix(path: Path) -> str:
+def source_timestamps(path: Path) -> tuple[str, str]:
     stat = path.stat()
     created_timestamp = getattr(stat, "st_birthtime", stat.st_ctime)
-    created = format_file_timestamp(created_timestamp)
-    modified = format_file_timestamp(stat.st_mtime)
+    return format_file_timestamp(created_timestamp), format_file_timestamp(stat.st_mtime)
+
+
+def source_timestamp_suffix(path: Path) -> str:
+    created, modified = source_timestamps(path)
     return f"_created-{created}_modified-{modified}"
 
 
@@ -188,10 +227,16 @@ def outputs_exist(paths: list[Path]) -> bool:
     return all(path.exists() and path.is_file() for path in paths)
 
 
+def fingerprint_matches(record_fingerprint: dict[str, Any] | None, fingerprint: dict[str, Any]) -> bool:
+    if not isinstance(record_fingerprint, dict):
+        return False
+    return all(record_fingerprint.get(key) == value for key, value in fingerprint.items())
+
+
 def is_complete(record: dict[str, Any] | None, fingerprint: dict[str, Any], formats: list[str]) -> bool:
     if not record or record.get("status") != "complete":
         return False
-    if record.get("fingerprint") != fingerprint:
+    if not fingerprint_matches(record.get("fingerprint"), fingerprint):
         return False
     if sorted(record.get("formats", [])) != sorted(formats):
         return False
@@ -261,27 +306,124 @@ def write_outputs(result: dict[str, Any], source_path: Path, project_base: Path,
     return project_outputs
 
 
-def mark_failure(state: dict[str, Any], key: str, fingerprint: dict[str, Any], error: BaseException) -> None:
+@contextmanager
+def transcription_source(source_path: Path, local_staging: bool, staging_dir: Path) -> Iterator[Path]:
+    if not local_staging:
+        yield source_path
+        return
+
+    staging_dir.mkdir(parents=True, exist_ok=True)
+    with tempfile.TemporaryDirectory(prefix="auto-whisper-", dir=staging_dir) as temp_dir:
+        staged_path = Path(temp_dir) / source_path.name
+        shutil.copy2(source_path, staged_path)
+        yield staged_path
+
+
+def mark_failure(
+    state: dict[str, Any],
+    key: str,
+    fingerprint: dict[str, Any],
+    fingerprint_mode: str,
+    local_staging: bool,
+    error: BaseException,
+) -> None:
     state["files"][key] = {
         "status": "failed",
         "fingerprint": fingerprint,
+        "fingerprint_mode": fingerprint_mode,
+        "local_staging": local_staging,
         "error": str(error),
         "traceback": traceback.format_exc(),
         "updated_at": datetime.now().isoformat(timespec="seconds"),
     }
 
 
+def host_path_for_pair(values: list[str], index: int) -> str:
+    return values[index] if index < len(values) else ""
+
+
+def build_mapping_record(
+    pair: InputOutputPair,
+    pair_index: int,
+    run_id: str,
+    run_output_dir: Path,
+    files_found: int,
+    formats: list[str],
+    host_input_dirs: list[str],
+    host_output_dirs: list[str],
+    fingerprint_mode: str,
+    local_staging: bool,
+) -> dict[str, Any]:
+    created, modified = source_timestamps(pair.input_dir)
+    return {
+        "pair_id": pair.id,
+        "host_input_dir": host_path_for_pair(host_input_dirs, pair_index),
+        "container_input_dir": str(pair.input_dir),
+        "host_output_root": host_path_for_pair(host_output_dirs, pair_index),
+        "container_output_root": str(pair.output_dir),
+        "run_id": run_id,
+        "run_output_dir": str(run_output_dir),
+        "source_folder_name": source_folder_name(pair.input_dir),
+        "input_created_timestamp": created,
+        "input_modified_timestamp": modified,
+        "formats": ",".join(formats),
+        "fingerprint_mode": fingerprint_mode,
+        "local_staging": local_staging,
+        "recursive_scan_enabled": True,
+        "supported_file_count": files_found,
+        "updated_at": datetime.now().isoformat(timespec="seconds"),
+    }
+
+
+def write_mapping_manifests(output_roots: list[Path], mappings: list[dict[str, Any]]) -> None:
+    if not mappings:
+        return
+
+    data = {
+        "version": 1,
+        "generated_at": datetime.now().isoformat(timespec="seconds"),
+        "mappings": mappings,
+    }
+    fieldnames = [
+        "pair_id",
+        "host_input_dir",
+        "container_input_dir",
+        "host_output_root",
+        "container_output_root",
+        "run_id",
+        "run_output_dir",
+        "source_folder_name",
+        "input_created_timestamp",
+        "input_modified_timestamp",
+        "formats",
+        "fingerprint_mode",
+        "local_staging",
+        "recursive_scan_enabled",
+        "supported_file_count",
+        "updated_at",
+    ]
+
+    for output_root in sorted(set(output_roots), key=lambda path: str(path)):
+        atomic_write_json(output_root / "input-output-mapping.json", data)
+        atomic_write_csv(output_root / "input-output-mapping.csv", mappings, fieldnames)
+
+
 def prepare_pair(
     pair: InputOutputPair,
+    pair_index: int,
     state: dict[str, Any],
     formats: list[str],
     extensions: list[str],
     run_config: dict[str, Any],
-) -> tuple[int, list[PendingFile]]:
+    host_input_dirs: list[str],
+    host_output_dirs: list[str],
+    fingerprint_mode: str,
+    local_staging: bool,
+) -> PreparedPair:
     files = scan_files(pair.input_dir, extensions)
     print(f"Found {len(files)} supported file(s) under {pair.input_dir}.", flush=True)
     if not files:
-        return 0, []
+        return PreparedPair(0, [], None)
 
     active_run_ids = state.setdefault("active_run_ids", {})
     active_run_id = active_run_ids.get(pair.id)
@@ -302,6 +444,18 @@ def prepare_pair(
         **run_config,
         "updated_at": datetime.now().isoformat(timespec="seconds"),
     }
+    mapping = build_mapping_record(
+        pair,
+        pair_index,
+        run_id,
+        run_output_dir,
+        len(files),
+        formats,
+        host_input_dirs,
+        host_output_dirs,
+        fingerprint_mode,
+        local_staging,
+    )
 
     skipped = 0
     pending: list[PendingFile] = []
@@ -311,7 +465,7 @@ def prepare_pair(
         relative_key = relative.as_posix()
         key = f"{pair.id}:{relative_key}"
         project_media_path = run_output_dir / relative
-        fingerprint = file_fingerprint(source_path)
+        fingerprint = file_fingerprint(source_path, fingerprint_mode)
 
         if is_complete(state["files"].get(key), fingerprint, formats):
             skipped += 1
@@ -325,7 +479,7 @@ def prepare_pair(
         state["runs"][run_key]["completed_at"] = datetime.now().isoformat(timespec="seconds")
         print(f"{pair.id} done. Completed: 0. Skipped: {skipped}. Failed: 0. Output: {run_output_dir}", flush=True)
 
-    return skipped, pending
+    return PreparedPair(skipped, pending, mapping)
 
 
 def main() -> int:
@@ -336,10 +490,15 @@ def main() -> int:
     task = parse_task(env("WHISPER_TASK", "transcribe"))
     condition_on_previous_text = parse_bool(env("WHISPER_CONDITION_ON_PREVIOUS_TEXT", "true"), "WHISPER_CONDITION_ON_PREVIOUS_TEXT")
     verbose = parse_bool(env("WHISPER_VERBOSE", "false"), "WHISPER_VERBOSE")
+    fingerprint_mode = parse_fingerprint_mode(env("FINGERPRINT_MODE", "metadata"))
+    local_staging = parse_bool(env("LOCAL_STAGING", "false"), "LOCAL_STAGING")
+    local_staging_dir = Path(env("LOCAL_STAGING_DIR", "/tmp/auto-whisper-staging"))
     formats = parse_formats("all")
     extensions = parse_list(env("SUPPORTED_EXTENSIONS", ".mp3,.wav,.m4a,.mp4,.mov,.mkv,.webm,.flac,.ogg,.aac,.wma"))
     pairs = parse_input_output_pairs()
     validate_pairs(pairs)
+    host_input_dirs = parse_path_list(env("SOURCE_DIRS"))
+    host_output_dirs = parse_path_list(env("OUTPUT_DIRS"))
 
     state = load_state(state_path)
     run_config = {
@@ -349,15 +508,33 @@ def main() -> int:
         "task": task,
         "condition_on_previous_text": condition_on_previous_text,
         "verbose": verbose,
+        "fingerprint_mode": fingerprint_mode,
+        "local_staging": local_staging,
+        "local_staging_dir": str(local_staging_dir) if local_staging else "",
     }
 
     skipped = 0
     pending: list[PendingFile] = []
-    for pair in pairs:
-        pair_skipped, pair_pending = prepare_pair(pair, state, formats, extensions, run_config)
-        skipped += pair_skipped
-        pending.extend(pair_pending)
+    mappings: list[dict[str, Any]] = []
+    for pair_index, pair in enumerate(pairs):
+        prepared = prepare_pair(
+            pair,
+            pair_index,
+            state,
+            formats,
+            extensions,
+            run_config,
+            host_input_dirs,
+            host_output_dirs,
+            fingerprint_mode,
+            local_staging,
+        )
+        skipped += prepared.skipped
+        pending.extend(prepared.pending)
+        if prepared.mapping:
+            mappings.append(prepared.mapping)
 
+    write_mapping_manifests([pair.output_dir for pair in pairs], mappings)
     atomic_write_json(state_path, state)
     if not pending:
         print(f"Done. Completed: 0. Skipped: {skipped}. Failed: 0.", flush=True)
@@ -381,7 +558,8 @@ def main() -> int:
             options["task"] = task
             options["condition_on_previous_text"] = condition_on_previous_text
             options["verbose"] = verbose
-            result = model.transcribe(str(item.source_path), **options)
+            with transcription_source(item.source_path, local_staging, local_staging_dir) as source_for_transcription:
+                result = model.transcribe(str(source_for_transcription), **options)
             project_outputs = write_outputs(result, item.source_path, item.output_media_path, formats)
             state["files"][item.state_key] = {
                 "status": "complete",
@@ -392,6 +570,8 @@ def main() -> int:
                 "output_dir": str(item.pair.output_dir),
                 "relative_path": item.display_key,
                 "fingerprint": item.fingerprint,
+                "fingerprint_mode": fingerprint_mode,
+                "local_staging": local_staging,
                 "formats": formats,
                 "project_outputs": [str(path) for path in project_outputs],
                 "completed_at": datetime.now().isoformat(timespec="seconds"),
@@ -400,7 +580,7 @@ def main() -> int:
         except Exception as exc:
             failed += 1
             print(f"Failed: {item.pair.id}:{item.display_key}: {exc}", file=sys.stderr, flush=True)
-            mark_failure(state, item.state_key, item.fingerprint, exc)
+            mark_failure(state, item.state_key, item.fingerprint, fingerprint_mode, local_staging, exc)
         finally:
             run_id = state["active_run_ids"].get(item.pair.id)
             run_key = state_run_key(item.pair.id, run_id) if run_id else ""

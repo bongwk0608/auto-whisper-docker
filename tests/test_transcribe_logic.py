@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import importlib.util
+import json
 import sys
 import tempfile
 import types
@@ -60,10 +61,12 @@ class TranscribeLogicTests(unittest.TestCase):
 
             pair = transcribe.InputOutputPair("pair-001", input_dir, output_dir)
             state = {"version": 1, "runs": {}, "files": {}}
-            _skipped, pending = transcribe.prepare_pair(pair, state, ["txt"], [".mp3"], {"model": "base"})
+            prepared = transcribe.prepare_pair(pair, 0, state, ["txt"], [".mp3"], {"model": "base"}, [], [], "metadata", False)
+            pending = prepared.pending
 
             self.assertEqual(len(pending), 1)
             self.assertEqual(pending[0].display_key, "course/week1/audio.mp3")
+            self.assertEqual(pending[0].state_key, "pair-001:course/week1/audio.mp3")
             self.assertEqual(pending[0].output_media_path.relative_to(output_dir / state["active_run_ids"]["pair-001"]).as_posix(), "course/week1/audio.mp3")
 
     def test_prepare_pair_reuses_existing_active_run_folder(self) -> None:
@@ -78,9 +81,167 @@ class TranscribeLogicTests(unittest.TestCase):
 
             pair = transcribe.InputOutputPair("pair-001", input_dir, output_dir)
             state = {"version": 1, "runs": {}, "files": {}, "active_run_ids": {"pair-001": "previous_active_run"}}
-            transcribe.prepare_pair(pair, state, ["txt"], [".mp3"], {"model": "base"})
+            prepared = transcribe.prepare_pair(pair, 0, state, ["txt"], [".mp3"], {"model": "base"}, [], [], "metadata", False)
 
             self.assertEqual(state["active_run_ids"]["pair-001"], "previous_active_run")
+            self.assertIsNotNone(prepared.mapping)
+            self.assertEqual(prepared.mapping["run_id"], "previous_active_run")
+
+    def test_scan_files_recurses_multiple_levels_and_ignores_unsupported_files(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            deep = root / "course" / "week1" / "day1"
+            deep.mkdir(parents=True)
+            (deep / "lecture.MP3").write_bytes(b"deep")
+            (root / "course" / "week1" / "slides.pdf").write_bytes(b"ignore")
+
+            files = transcribe.scan_files(root, [".mp3"])
+
+            self.assertEqual([path.relative_to(root).as_posix() for path in files], ["course/week1/day1/lecture.MP3"])
+
+    def test_mapping_manifest_includes_pair_details_and_file_count(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            input_a = root / "Downloads"
+            input_b = root / "UM CS"
+            output_root = root / "output"
+            (input_a / "nested").mkdir(parents=True)
+            (input_b / "course" / "week1").mkdir(parents=True)
+            (input_a / "nested" / "a.mp3").write_bytes(b"a")
+            (input_b / "course" / "week1" / "b.wav").write_bytes(b"b")
+
+            state = {"version": 1, "runs": {}, "files": {}}
+            formats = ["txt", "json"]
+            host_inputs = ["/mnt/c/Users/USER/Downloads", "/mnt/y/Class Recording/UM CS"]
+            host_outputs = ["/mnt/d/auto_whisper/output", "/mnt/d/auto_whisper/output"]
+            pair_a = transcribe.InputOutputPair("pair-001", input_a, output_root)
+            pair_b = transcribe.InputOutputPair("pair-002", input_b, output_root)
+
+            prepared_a = transcribe.prepare_pair(pair_a, 0, state, formats, [".mp3", ".wav"], {"model": "base"}, host_inputs, host_outputs, "metadata", False)
+            prepared_b = transcribe.prepare_pair(pair_b, 1, state, formats, [".mp3", ".wav"], {"model": "base"}, host_inputs, host_outputs, "metadata", False)
+
+            mappings = [prepared_a.mapping, prepared_b.mapping]
+            self.assertEqual([mapping["pair_id"] for mapping in mappings], ["pair-001", "pair-002"])
+            self.assertEqual(mappings[0]["host_input_dir"], "/mnt/c/Users/USER/Downloads")
+            self.assertEqual(mappings[1]["host_input_dir"], "/mnt/y/Class Recording/UM CS")
+            self.assertEqual(mappings[0]["host_output_root"], "/mnt/d/auto_whisper/output")
+            self.assertTrue(mappings[1]["recursive_scan_enabled"])
+            self.assertEqual(mappings[1]["fingerprint_mode"], "metadata")
+            self.assertFalse(mappings[1]["local_staging"])
+            self.assertEqual(mappings[0]["supported_file_count"], 1)
+            self.assertEqual(mappings[1]["supported_file_count"], 1)
+            self.assertRegex(mappings[1]["run_id"], r"^UM_CS_created-\d{14}_modified-\d{14}$")
+            self.assertEqual(prepared_b.pending[0].output_media_path.relative_to(output_root / mappings[1]["run_id"]).as_posix(), "course/week1/b.wav")
+
+    def test_write_mapping_manifests_writes_json_and_csv(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            output_root = Path(temp_dir)
+            mappings = [
+                {
+                    "pair_id": "pair-001",
+                    "host_input_dir": "/host/input",
+                    "container_input_dir": "/inputs/input-001",
+                    "host_output_root": "/host/output",
+                    "container_output_root": "/outputs/output-001",
+                    "run_id": "input_created-20260520120000_modified-20260520120500",
+                    "run_output_dir": "/outputs/output-001/input_created-20260520120000_modified-20260520120500",
+                    "source_folder_name": "input",
+                    "input_created_timestamp": "20260520120000",
+                    "input_modified_timestamp": "20260520120500",
+                    "formats": "txt,json",
+                    "fingerprint_mode": "metadata",
+                    "local_staging": False,
+                    "recursive_scan_enabled": True,
+                    "supported_file_count": 2,
+                    "updated_at": "2026-05-20T12:05:00",
+                }
+            ]
+
+            transcribe.write_mapping_manifests([output_root], mappings)
+
+            manifest = json.loads((output_root / "input-output-mapping.json").read_text(encoding="utf-8"))
+            csv_text = (output_root / "input-output-mapping.csv").read_text(encoding="utf-8")
+            self.assertEqual(manifest["mappings"][0]["pair_id"], "pair-001")
+            self.assertIn("recursive_scan_enabled", csv_text)
+            self.assertIn("pair-001", csv_text)
+
+    def test_metadata_fingerprint_does_not_include_sha256(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            path = Path(temp_dir) / "audio.mp3"
+            path.write_bytes(b"audio")
+
+            fingerprint = transcribe.file_fingerprint(path, "metadata")
+
+            self.assertEqual(fingerprint["size"], 5)
+            self.assertIn("mtime_ns", fingerprint)
+            self.assertNotIn("sha256", fingerprint)
+
+    def test_sha256_fingerprint_includes_sha256(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            path = Path(temp_dir) / "audio.mp3"
+            path.write_bytes(b"audio")
+
+            fingerprint = transcribe.file_fingerprint(path, "sha256")
+
+            self.assertEqual(fingerprint["size"], 5)
+            self.assertEqual(fingerprint["sha256"], "6ed8919ce20490a5e3ad8630a4fab69475297abd07db73918dd5f36fcfaeb11b")
+
+    def test_invalid_fingerprint_mode_raises_clear_error(self) -> None:
+        with self.assertRaisesRegex(ValueError, "FINGERPRINT_MODE"):
+            transcribe.parse_fingerprint_mode("full")
+
+    def test_metadata_fingerprint_can_match_existing_sha256_record(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            output = Path(temp_dir) / "out.txt"
+            output.write_text("done", encoding="utf-8")
+            fingerprint = {"size": 5, "mtime_ns": 123}
+            record = {
+                "status": "complete",
+                "fingerprint": {"size": 5, "mtime_ns": 123, "sha256": "old"},
+                "formats": ["txt"],
+                "project_outputs": [str(output)],
+            }
+
+            self.assertTrue(transcribe.is_complete(record, fingerprint, ["txt"]))
+
+    def test_metadata_fingerprint_change_retriggers_work(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            output = Path(temp_dir) / "out.txt"
+            output.write_text("done", encoding="utf-8")
+            record = {
+                "status": "complete",
+                "fingerprint": {"size": 5, "mtime_ns": 123},
+                "formats": ["txt"],
+                "project_outputs": [str(output)],
+            }
+
+            self.assertFalse(transcribe.is_complete(record, {"size": 6, "mtime_ns": 123}, ["txt"]))
+            self.assertFalse(transcribe.is_complete(record, {"size": 5, "mtime_ns": 124}, ["txt"]))
+
+    def test_transcription_source_stages_and_cleans_pending_file(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            source = root / "network" / "audio.mp3"
+            staging = root / "staging"
+            source.parent.mkdir()
+            source.write_bytes(b"audio")
+
+            with transcribe.transcription_source(source, True, staging) as staged:
+                self.assertNotEqual(staged, source)
+                self.assertTrue(staged.exists())
+                self.assertEqual(staged.name, source.name)
+                self.assertEqual(staged.read_bytes(), b"audio")
+                staged_parent = staged.parent
+
+            self.assertFalse(staged_parent.exists())
+
+    def test_transcription_source_without_staging_uses_original_file(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            source = Path(temp_dir) / "audio.mp3"
+            source.write_bytes(b"audio")
+
+            with transcribe.transcription_source(source, False, Path(temp_dir) / "staging") as path:
+                self.assertEqual(path, source)
 
 
 if __name__ == "__main__":

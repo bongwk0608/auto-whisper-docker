@@ -7,6 +7,8 @@ x-whisper-volumes: &whisper-volumes
     target: /root/.cache/whisper
 
 x-whisper-environment: &whisper-environment
+  SOURCE_DIRS: ${SOURCE_DIRS:-}
+  OUTPUT_DIRS: ${OUTPUT_DIRS:-}
   INPUT_OUTPUT_PAIRS: ${INPUT_OUTPUT_PAIRS:-}
   INPUT_DIR: ${INPUT_DIR:-/input}
   PROJECT_OUTPUT_DIR: ${PROJECT_OUTPUT_DIR:-/project-output}
@@ -16,8 +18,11 @@ x-whisper-environment: &whisper-environment
   WHISPER_LANGUAGE: ${WHISPER_LANGUAGE:-}
   WHISPER_TASK: ${WHISPER_TASK:-transcribe}
   WHISPER_DOWNLOAD_DEVICE: ${WHISPER_DOWNLOAD_DEVICE:-cpu}
-  WHISPER_CONDITION_ON_PREVIOUS_TEXT: ${WHISPER_CONDITION_ON_PREVIOUS_TEXT:-true}
-  WHISPER_VERBOSE: ${WHISPER_VERBOSE:-false}
+  WHISPER_CONDITION_ON_PREVIOUS_TEXT: ${WHISPER_CONDITION_ON_PREVIOUS_TEXT:-false}
+  WHISPER_VERBOSE: ${WHISPER_VERBOSE:-true}
+  FINGERPRINT_MODE: ${FINGERPRINT_MODE:-metadata}
+  LOCAL_STAGING: ${LOCAL_STAGING:-false}
+  LOCAL_STAGING_DIR: ${LOCAL_STAGING_DIR:-/tmp/auto-whisper-staging}
   SUPPORTED_EXTENSIONS: ${SUPPORTED_EXTENSIONS:-.mp3,.wav,.m4a,.mp4,.mov,.mkv,.webm,.flac,.ogg,.aac,.wma}
 
 services:

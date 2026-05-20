@@ -334,13 +334,33 @@ For each source folder, transcript files are written into:
 output/<source_folder_name>_created-<YYYYMMDDHHMMSS>_modified-<YYYYMMDDHHMMSS>/
 ```
 
-Relative subfolders are preserved in that output folder. Transcript sidecars are not written beside the original media files.
+Relative subfolders are preserved in that output folder. For example, a source file at `course/week1/audio.mp3` writes transcript files under `course/week1/` inside that source folder's timestamped output folder. Transcript sidecars are not written beside the original media files.
+
+The output root also contains mapping manifests that show which input folder maps to which timestamped output folder:
+
+```text
+output/input-output-mapping.json
+output/input-output-mapping.csv
+```
+
+The mapping includes each pair id, host input path when available, container input path, host output root when available, container output root, timestamped run output folder, input folder created/modified timestamps, output formats, recursive scan status, and the number of supported files found under that input folder.
+
+When multiple input folders share the same output root, each input still gets its own timestamped subfolder. For example:
+
+```text
+/mnt/c/Users/USER/Downloads -> /mnt/d/auto_whisper/output/Downloads_created-<YYYYMMDDHHMMSS>_modified-<YYYYMMDDHHMMSS>/
+/mnt/y/Class Recording/UM CS -> /mnt/d/auto_whisper/output/UM_CS_created-<YYYYMMDDHHMMSS>_modified-<YYYYMMDDHHMMSS>/
+```
 
 ## Resume Behavior
 
 Progress is stored in `state/progress.json`, which is ignored by Git.
 
 If a run is interrupted, run Compose again. Completed files are skipped when the source fingerprint and expected outputs still match. Failed files are recorded and retried on the next run. Each input/output pair reuses its active timestamped output folder while a run is incomplete.
+
+By default, `FINGERPRINT_MODE=metadata` uses file size and modified timestamp for fast skip checks, which is much faster for large network-drive folders. Set `FINGERPRINT_MODE=sha256` if you want the older maximum-safety behavior that reads each supported file fully before deciding whether to skip it.
+
+`LOCAL_STAGING=false` by default, so pending media files are transcribed directly from their mounted input path. If network reads are unstable during transcription, set `LOCAL_STAGING=true`; Auto Whisper will copy only the current pending file to `LOCAL_STAGING_DIR`, transcribe that local temporary copy, and clean it up afterward. It does not cache or copy the whole input folder.
 
 ## Configuration
 
@@ -359,12 +379,15 @@ Important `.env` values:
 - `WHISPER_FP16`: `false` for CPU, `auto` for CUDA, or explicit `true`/`false`
 - `WHISPER_CONDITION_ON_PREVIOUS_TEXT`: `true` or `false`
 - `WHISPER_VERBOSE`: `true` or `false`
+- `FINGERPRINT_MODE`: `metadata` for fast network-drive skip checks, or `sha256` for full-file hashing
+- `LOCAL_STAGING`: `true` to copy only pending files to local temporary storage before transcription
+- `LOCAL_STAGING_DIR`: staging directory used when `LOCAL_STAGING=true`
 - `SUPPORTED_EXTENSIONS`: comma-separated file extensions to scan
 
 Recommended defaults:
 
-- CPU: `WHISPER_DEVICE=cpu`, `WHISPER_FP16=false`, `NVIDIA_VISIBLE_DEVICES=void`
-- CUDA: `WHISPER_DEVICE=auto`, `WHISPER_FP16=auto`, `NVIDIA_VISIBLE_DEVICES=all`
+- CPU: `WHISPER_DEVICE=cpu`, `WHISPER_FP16=false`, `FINGERPRINT_MODE=metadata`, `LOCAL_STAGING=false`, `NVIDIA_VISIBLE_DEVICES=void`
+- CUDA: `WHISPER_DEVICE=auto`, `WHISPER_FP16=auto`, `FINGERPRINT_MODE=metadata`, `LOCAL_STAGING=false`, `NVIDIA_VISIBLE_DEVICES=all`
 
 ## Resource Checks
 
