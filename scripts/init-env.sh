@@ -3,12 +3,13 @@ set -eu
 
 SOURCE_DIRS=""
 OUTPUT_DIRS=""
+SOURCE_LIST_FILE=""
 MODEL="base"
 OUTPUT_FORMAT="all"
 CUDA="false"
 
 usage() {
-  echo "Usage: $0 --source-dir /path/to/audio-folder [--source-dir ...] [--output-dir /path/to/transcripts ...] [--model base] [--output-format all] [--cuda]"
+  echo "Usage: $0 [--source-list-file ./input-folders.txt] [--source-dir /path/to/audio-folder ...] [--output-dir /path/to/transcripts ...] [--model base] [--output-format all] [--cuda]"
 }
 
 append_value() {
@@ -45,8 +46,46 @@ yaml_quote() {
   printf '"%s"' "$(json_escape "$1")"
 }
 
+normalize_host_path() {
+  RAW_PATH="$1"
+  case "$RAW_PATH" in
+    [A-Za-z]:*)
+      DRIVE="$(printf '%s' "$RAW_PATH" | cut -c 1 | tr '[:upper:]' '[:lower:]')"
+      REST="$(printf '%s' "$RAW_PATH" | cut -c 3- | sed 's#\\#/#g')"
+      case "$REST" in
+        "") printf '/mnt/%s' "$DRIVE" ;;
+        /*) printf '/mnt/%s%s' "$DRIVE" "$REST" ;;
+        *) printf '/mnt/%s/%s' "$DRIVE" "$REST" ;;
+      esac
+      ;;
+    *)
+      printf '%s' "$RAW_PATH"
+      ;;
+  esac
+}
+
+read_source_list_file() {
+  LIST_PATH="$1"
+  if [ ! -f "$LIST_PATH" ]; then
+    echo "Source list file does not exist: $LIST_PATH" >&2
+    exit 1
+  fi
+
+  while IFS= read -r LINE || [ -n "$LINE" ]; do
+    TRIMMED="$(printf '%s' "$LINE" | sed 's/^[[:space:]]*//; s/[[:space:]]*$//')"
+    case "$TRIMMED" in
+      ""|\#*) ;;
+      *) SOURCE_DIRS="$(append_value "$SOURCE_DIRS" "$TRIMMED")" ;;
+    esac
+  done < "$LIST_PATH"
+}
+
 while [ "$#" -gt 0 ]; do
   case "$1" in
+    --source-list-file)
+      SOURCE_LIST_FILE="${2:-}"
+      shift 2
+      ;;
     --source-dir)
       SOURCE_DIRS="$(append_value "$SOURCE_DIRS" "${2:-}")"
       shift 2
@@ -82,6 +121,10 @@ done
 PROJECT_ROOT="$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)"
 ENV_PATH="$PROJECT_ROOT/.env"
 OVERRIDE_PATH="$PROJECT_ROOT/docker-compose.override.yml"
+
+if [ -n "$SOURCE_LIST_FILE" ]; then
+  read_source_list_file "$SOURCE_LIST_FILE"
+fi
 
 if [ -z "$SOURCE_DIRS" ]; then
   while :; do
@@ -121,8 +164,8 @@ RESOLVED_SOURCE_DIRS=""
 RESOLVED_OUTPUT_DIRS=""
 INDEX=1
 while [ "$INDEX" -le "$SOURCE_COUNT" ]; do
-  SOURCE_DIR="$(value_at "$INDEX" "$SOURCE_DIRS")"
-  OUTPUT_DIR="$(value_at "$INDEX" "$OUTPUT_DIRS")"
+  SOURCE_DIR="$(normalize_host_path "$(value_at "$INDEX" "$SOURCE_DIRS")")"
+  OUTPUT_DIR="$(normalize_host_path "$(value_at "$INDEX" "$OUTPUT_DIRS")")"
 
   if [ ! -d "$SOURCE_DIR" ]; then
     echo "Source directory does not exist or is not a folder: $SOURCE_DIR" >&2

@@ -24,16 +24,25 @@ The GitHub repo should contain only code and documentation. Local media, transcr
 
 Start Docker first, then clone the repo and enter the project folder.
 
+Create an editable input folder list:
+
+```powershell
+Copy-Item input-folders.example.txt input-folders.txt
+notepad input-folders.txt
+```
+
 Generate `.env` on Windows:
 
 ```powershell
-.\scripts\init-env.ps1 -SourceDirs "D:\path\to\audio-folder"
+.\scripts\init-env.ps1 -SourceListFile ".\input-folders.txt"
 ```
 
 Generate `.env` on Linux or macOS:
 
 ```sh
-sh ./scripts/init-env.sh --source-dir /path/to/audio-folder
+cp input-folders.example.txt input-folders.txt
+${EDITOR:-vi} input-folders.txt
+sh ./scripts/init-env.sh --source-list-file ./input-folders.txt
 ```
 
 The helper writes both `.env` and `docker-compose.override.yml`. The override file contains local folder bind mounts and is ignored by Git.
@@ -53,10 +62,39 @@ nvidia-smi
 docker run --rm --gpus all nvidia/cuda:12.4.1-base-ubuntu22.04 nvidia-smi
 ```
 
+If your input folders are on mapped Windows network drives such as `X:`, `Y:`, or `Z:`, mount them inside WSL before generating `.env`:
+
+```sh
+sh ./scripts/mount-wsl-network-drives.sh
+```
+
+The helper reads the current Windows mappings from `net.exe use` and mounts connected drives at `/mnt/x`, `/mnt/y`, and `/mnt/z`. If a drive is only available while connected to VPN, connect the VPN first, then rerun the helper.
+
+To mount those drives automatically when WSL starts and retry after VPN or internet reconnects, install the systemd timer from WSL:
+
+```sh
+sh ./scripts/install-wsl-network-drive-automount.sh
+```
+
+The timer runs once shortly after WSL starts and then retries every minute. It remounts stale drives when `/mnt/x`, `/mnt/y`, or `/mnt/z` exists but the network share is no longer reachable. If systemd is not enabled in WSL, add this to `/etc/wsl.conf`, then run `wsl --shutdown` from Windows PowerShell and start WSL again:
+
+```ini
+[boot]
+systemd=true
+```
+
+For selected drives only:
+
+```sh
+sh ./scripts/install-wsl-network-drive-automount.sh "Y Z"
+```
+
 Generate WSL-native `.env` and `docker-compose.override.yml` files from inside WSL. If your source media is still on Windows drive `D:`, use the `/mnt/d/...` path:
 
 ```sh
-sh ./scripts/init-env.sh --source-dir /mnt/d/auto_whisper/test_input --cuda --model medium --output-format all
+cp input-folders.example.txt input-folders.txt
+printf '%s\n' '/mnt/d/auto_whisper/test_input' > input-folders.txt
+sh ./scripts/init-env.sh --source-list-file ./input-folders.txt --cuda --model medium --output-format all
 ```
 
 Validate and run the CUDA service:
@@ -78,26 +116,29 @@ Keep `models/`, `output/`, and `state/` local to the WSL repo when possible. If 
 
 ## Adding Or Changing Input Folders
 
-Add or change folders by rerunning the setup helper. The helper updates both `.env` and `docker-compose.override.yml`; keep those files in sync because `.env` names the input/output pairs and the override file creates the Docker bind mounts.
+Add or change folders by editing `input-folders.txt`, then rerunning the setup helper. The helper updates both `.env` and `docker-compose.override.yml`; keep those files in sync because `.env` names the input/output pairs and the override file creates the Docker bind mounts.
+
+The list file uses one folder path per line. Blank lines and lines starting with `#` are ignored. `input-folders.txt` is ignored by Git so local private paths stay out of commits.
 
 From Windows PowerShell with Docker Desktop, use Windows paths:
 
 ```powershell
-.\scripts\init-env.ps1 -SourceDirs "D:\audio-a,D:\audio-b"
+Copy-Item input-folders.example.txt input-folders.txt
+notepad input-folders.txt
+.\scripts\init-env.ps1 -SourceListFile ".\input-folders.txt"
 ```
 
 From WSL, use WSL paths. Windows drive `D:\...` becomes `/mnt/d/...`, and `C:\Users\USER\Downloads` becomes `/mnt/c/Users/USER/Downloads`:
 
 ```sh
 sh ./scripts/init-env.sh \
-  --source-dir "/mnt/d/WOC7014 Framework – Based Software Design and Development" \
-  --source-dir "/mnt/c/Users/USER/Downloads" \
+  --source-list-file ./input-folders.txt \
   --model medium \
   --output-format all \
   --cuda
 ```
 
-The source folders should normally live outside this repo. Transcripts are written only under this repo's `output/` folder by default. Advanced users can still pass `-OutputDirs` or `--output-dir` values if they want custom output roots.
+The source folders should normally live outside this repo. Transcripts are written only under this repo's `output/` folder by default. Advanced users can still pass `-SourceDirs` / `--source-dir` directly, and can pass `-OutputDirs` or `--output-dir` values if they want custom output roots.
 
 Validate the generated Compose configuration after changing folders:
 
@@ -280,17 +321,17 @@ For each source file, `WHISPER_OUTPUT_FORMAT=all` writes:
 Example files in the paired output folder:
 
 ```text
-output/audio-folder_created-20260517143000/song_created-20260517143000_modified-20260517154512.txt
-output/audio-folder_created-20260517143000/song_created-20260517143000_modified-20260517154512.json
-output/audio-folder_created-20260517143000/song_created-20260517143000_modified-20260517154512.tsv
-output/audio-folder_created-20260517143000/song_created-20260517143000_modified-20260517154512.srt
-output/audio-folder_created-20260517143000/song_created-20260517143000_modified-20260517154512.vtt
+output/audio-folder_created-20260517143000_modified-20260517154512/song_created-20260517143000_modified-20260517154512.txt
+output/audio-folder_created-20260517143000_modified-20260517154512/song_created-20260517143000_modified-20260517154512.json
+output/audio-folder_created-20260517143000_modified-20260517154512/song_created-20260517143000_modified-20260517154512.tsv
+output/audio-folder_created-20260517143000_modified-20260517154512/song_created-20260517143000_modified-20260517154512.srt
+output/audio-folder_created-20260517143000_modified-20260517154512/song_created-20260517143000_modified-20260517154512.vtt
 ```
 
 For each source folder, transcript files are written into:
 
 ```text
-output/<source_folder_name>_created-<YYYYMMDDHHMMSS>/
+output/<source_folder_name>_created-<YYYYMMDDHHMMSS>_modified-<YYYYMMDDHHMMSS>/
 ```
 
 Relative subfolders are preserved in that output folder. Transcript sidecars are not written beside the original media files.
@@ -305,6 +346,7 @@ If a run is interrupted, run Compose again. Completed files are skipped when the
 
 Important `.env` values:
 
+- `input-folders.txt`: editable local source folder list used by `-SourceListFile` or `--source-list-file`; ignored by Git
 - `SOURCE_DIRS`: semicolon-separated host folders containing audio/video files; generated by setup scripts
 - `OUTPUT_DIRS`: semicolon-separated host transcript output folders; defaults to this project's `output/` directory for every source
 - `INPUT_OUTPUT_PAIRS`: JSON array of container-side input/output pairs; generated by setup scripts
@@ -416,6 +458,7 @@ Safe to commit:
 Do not commit:
 
 - `.env`
+- `input-folders.txt`
 - `docker-compose.override.yml`
 - `output/`
 - `state/`
@@ -430,12 +473,12 @@ Before pushing to GitHub, run:
 git status --short
 ```
 
-Confirm that no private files are staged. In particular, `.env`, `docker-compose.override.yml`, `output/`, `state/`, `test_input/`, `models/*.pt`, source media, and generated transcripts must not appear.
+Confirm that no private files are staged. In particular, `.env`, `input-folders.txt`, `docker-compose.override.yml`, `output/`, `state/`, `test_input/`, `models/*.pt`, source media, and generated transcripts must not appear.
 
 To verify ignore rules for specific paths:
 
 ```sh
-git check-ignore .env docker-compose.override.yml output/ state/ test_input/ models/small.pt
+git check-ignore .env input-folders.txt docker-compose.override.yml output/ state/ test_input/ models/small.pt
 ```
 
 If a confidential file was already committed in a previous repository history, removing it from the working tree is not enough. Rotate any exposed credentials and purge the file from Git history before publishing.

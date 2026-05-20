@@ -3,6 +3,7 @@ param(
     [string[]]$OutputDirs = @(),
     [string]$SourceDir = "",
     [string]$OutputDir = "",
+    [string]$SourceListFile = "",
     [string]$Model = "base",
     [string]$OutputFormat = "all",
     [switch]$Cuda
@@ -58,6 +59,22 @@ function Expand-PathList {
     return $Expanded
 }
 
+function Read-SourceListFile {
+    param([string]$Path)
+    if (-not (Test-Path -LiteralPath $Path -PathType Leaf)) {
+        throw "Source list file does not exist: $Path"
+    }
+
+    $Items = @()
+    foreach ($Line in Get-Content -LiteralPath $Path) {
+        $Trimmed = $Line.Trim()
+        if ($Trimmed -and -not $Trimmed.StartsWith("#")) {
+            $Items += $Trimmed
+        }
+    }
+    return $Items
+}
+
 if ($SourceDir) {
     $SourceDirs += $SourceDir
 }
@@ -67,6 +84,9 @@ if ($OutputDir) {
 
 $SourceDirs = Expand-PathList -Values $SourceDirs
 $OutputDirs = Expand-PathList -Values $OutputDirs
+if ($SourceListFile) {
+    $SourceDirs += Read-SourceListFile -Path $SourceListFile
+}
 
 while ($SourceDirs.Count -eq 0) {
     $InputValue = Read-Host "Enter the full audio/video source folder path"

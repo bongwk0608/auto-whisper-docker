@@ -14,6 +14,8 @@ jobs:
           python-version: "3.11"
       - name: Compile Python
         run: python -m py_compile scripts/transcribe.py scripts/download_model.py
+      - name: Run Python Tests
+        run: python -m unittest discover -s tests
       - name: Validate CPU Compose
         run: docker compose --env-file .env.example.cpu config
       - name: Validate CUDA Compose Profile

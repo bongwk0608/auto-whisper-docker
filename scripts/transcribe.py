@@ -156,10 +156,7 @@ def source_folder_name(input_dir: Path) -> str:
 
 def make_run_id(input_dir: Path) -> str:
     safe_name = "".join(ch if ch.isalnum() or ch in "._-" else "_" for ch in source_folder_name(input_dir))
-    stat = input_dir.stat()
-    created_timestamp = getattr(stat, "st_birthtime", stat.st_ctime)
-    created = format_file_timestamp(created_timestamp)
-    return f"{safe_name}_created-{created}"
+    return f"{safe_name}{source_timestamp_suffix(input_dir)}"
 
 
 def state_run_key(pair_id: str, run_id: str) -> str:

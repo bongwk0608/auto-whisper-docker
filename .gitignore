@@ -1,4 +1,5 @@
 .env
+input-folders.txt
 docker-compose.override.yml
 output/
 state/

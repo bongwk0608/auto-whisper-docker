@@ -1,0 +1,8 @@
+# One input folder per line. Blank lines and lines starting with # are ignored.
+# Copy this file to input-folders.txt, then edit it with your real local paths.
+
+# Windows PowerShell / Docker Desktop example:
+# D:\path\to\audio-folder
+
+# WSL / Linux / macOS example:
+# /mnt/d/path/to/audio-folder
