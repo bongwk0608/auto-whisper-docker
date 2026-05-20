@@ -5,6 +5,9 @@ x-whisper-volumes: &whisper-volumes
   - type: bind
     source: ./models
     target: /root/.cache/whisper
+  - type: bind
+    source: ./output_overall
+    target: /overall-output
 
 x-whisper-environment: &whisper-environment
   SOURCE_DIRS: ${SOURCE_DIRS:-}
@@ -23,6 +26,8 @@ x-whisper-environment: &whisper-environment
   FINGERPRINT_MODE: ${FINGERPRINT_MODE:-metadata}
   LOCAL_STAGING: ${LOCAL_STAGING:-false}
   LOCAL_STAGING_DIR: ${LOCAL_STAGING_DIR:-/tmp/auto-whisper-staging}
+  OVERALL_OUTPUT_ENABLED: ${OVERALL_OUTPUT_ENABLED:-true}
+  OVERALL_OUTPUT_DIR: ${OVERALL_OUTPUT_DIR:-/overall-output}
   SUPPORTED_EXTENSIONS: ${SUPPORTED_EXTENSIONS:-.mp3,.wav,.m4a,.mp4,.mov,.mkv,.webm,.flac,.ogg,.aac,.wma}
 
 services:

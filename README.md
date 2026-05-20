@@ -338,6 +338,21 @@ When setup scripts provide `SOURCE_DIRS`, `<source_folder_name>` comes from the 
 
 Relative subfolders are preserved in that output folder. For example, a source file at `course/week1/audio.mp3` writes transcript files under `course/week1/` inside that source folder's timestamped output folder. Transcript sidecars are not written beside the original media files.
 
+Auto Whisper also writes transcript copies to a merged overall view:
+
+```text
+output_overall/pair-001/
+output_overall/pair-002/
+```
+
+This view does not include the timestamped run folder layer. It accumulates transcript outputs by input pair id, preserving the same relative nested source paths. For example, `pair-002` source file `Dissertation Discussion/STEREO/FOLDER01/ZOOM0001.WAV` also writes copies under:
+
+```text
+output_overall/pair-002/Dissertation Discussion/STEREO/FOLDER01/ZOOM0001_created-<YYYYMMDDHHMMSS>_modified-<YYYYMMDDHHMMSS>.txt
+```
+
+If the same overall destination already exists, the newest generated transcript overwrites it. Original media files are not copied into `output_overall/`.
+
 The output root also contains mapping manifests that show which input folder maps to which timestamped output folder:
 
 ```text
@@ -345,7 +360,7 @@ output/input-output-mapping.json
 output/input-output-mapping.csv
 ```
 
-The mapping includes each pair id, host input path when available, container input path, host output root when available, container output root, timestamped run output folder, input folder created/modified timestamps, output formats, recursive scan status, and the number of supported files found under that input folder.
+The mapping includes each pair id, host input path when available, container input path, host output root when available, container output root, timestamped run output folder, overall output folder, input folder created/modified timestamps, output formats, recursive scan status, and the number of supported files found under that input folder.
 
 When multiple input folders share the same output root, each input still gets its own timestamped subfolder. For example:
 
@@ -384,12 +399,14 @@ Important `.env` values:
 - `FINGERPRINT_MODE`: `metadata` for fast network-drive skip checks, or `sha256` for full-file hashing
 - `LOCAL_STAGING`: `true` to copy only pending files to local temporary storage before transcription
 - `LOCAL_STAGING_DIR`: staging directory used when `LOCAL_STAGING=true`
+- `OVERALL_OUTPUT_ENABLED`: `true` to copy transcript outputs into merged `output_overall/pair-###/` folders
+- `OVERALL_OUTPUT_DIR`: container path for the merged overall output, normally `/overall-output`
 - `SUPPORTED_EXTENSIONS`: comma-separated file extensions to scan
 
 Recommended defaults:
 
-- CPU: `WHISPER_DEVICE=cpu`, `WHISPER_FP16=false`, `FINGERPRINT_MODE=metadata`, `LOCAL_STAGING=false`, `NVIDIA_VISIBLE_DEVICES=void`
-- CUDA: `WHISPER_DEVICE=auto`, `WHISPER_FP16=auto`, `FINGERPRINT_MODE=metadata`, `LOCAL_STAGING=false`, `NVIDIA_VISIBLE_DEVICES=all`
+- CPU: `WHISPER_DEVICE=cpu`, `WHISPER_FP16=false`, `FINGERPRINT_MODE=metadata`, `LOCAL_STAGING=false`, `OVERALL_OUTPUT_ENABLED=true`, `NVIDIA_VISIBLE_DEVICES=void`
+- CUDA: `WHISPER_DEVICE=auto`, `WHISPER_FP16=auto`, `FINGERPRINT_MODE=metadata`, `LOCAL_STAGING=false`, `OVERALL_OUTPUT_ENABLED=true`, `NVIDIA_VISIBLE_DEVICES=all`
 
 ## Resource Checks
 

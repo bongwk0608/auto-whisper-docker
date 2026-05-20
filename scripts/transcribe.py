@@ -321,6 +321,34 @@ def write_outputs(result: dict[str, Any], source_path: Path, project_base: Path,
     return project_outputs
 
 
+def relative_display_path(display_key: str) -> Path:
+    return Path(*[part for part in display_key.split("/") if part])
+
+
+def overall_output_base(overall_output_dir: Path, pair_id: str, display_key: str, source_path: Path) -> Path:
+    return timestamped_output_base(overall_output_dir / pair_id / relative_display_path(display_key), timestamp_source=source_path)
+
+
+def copy_overall_outputs(
+    project_outputs: list[Path],
+    source_path: Path,
+    display_key: str,
+    pair_id: str,
+    overall_output_enabled: bool,
+    overall_output_dir: Path,
+    formats: list[str],
+) -> list[Path]:
+    if not overall_output_enabled:
+        return []
+
+    overall_base = overall_output_base(overall_output_dir, pair_id, display_key, source_path)
+    overall_outputs = expected_outputs(overall_base, formats)
+    for project_output, overall_output in zip(project_outputs, overall_outputs):
+        overall_output.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(project_output, overall_output)
+    return overall_outputs
+
+
 @contextmanager
 def transcription_source(source_path: Path, local_staging: bool, staging_dir: Path) -> Iterator[Path]:
     if not local_staging:
@@ -369,6 +397,8 @@ def build_mapping_record(
     host_output_dirs: list[str],
     fingerprint_mode: str,
     local_staging: bool,
+    overall_output_enabled: bool,
+    overall_output_dir: Path,
 ) -> dict[str, Any]:
     created, modified = source_timestamps(pair.input_dir)
     return {
@@ -385,6 +415,9 @@ def build_mapping_record(
         "formats": ",".join(formats),
         "fingerprint_mode": fingerprint_mode,
         "local_staging": local_staging,
+        "overall_output_enabled": overall_output_enabled,
+        "overall_output_root": str(overall_output_dir) if overall_output_enabled else "",
+        "overall_pair_output_dir": str(overall_output_dir / pair.id) if overall_output_enabled else "",
         "recursive_scan_enabled": True,
         "supported_file_count": files_found,
         "updated_at": datetime.now().isoformat(timespec="seconds"),
@@ -414,6 +447,9 @@ def write_mapping_manifests(output_roots: list[Path], mappings: list[dict[str, A
         "formats",
         "fingerprint_mode",
         "local_staging",
+        "overall_output_enabled",
+        "overall_output_root",
+        "overall_pair_output_dir",
         "recursive_scan_enabled",
         "supported_file_count",
         "updated_at",
@@ -435,6 +471,8 @@ def prepare_pair(
     host_output_dirs: list[str],
     fingerprint_mode: str,
     local_staging: bool,
+    overall_output_enabled: bool,
+    overall_output_dir: Path,
 ) -> PreparedPair:
     files = scan_files(pair.input_dir, extensions)
     print(f"Found {len(files)} supported file(s) under {pair.input_dir}.", flush=True)
@@ -474,6 +512,8 @@ def prepare_pair(
         host_output_dirs,
         fingerprint_mode,
         local_staging,
+        overall_output_enabled,
+        overall_output_dir,
     )
 
     skipped = 0
@@ -512,6 +552,8 @@ def main() -> int:
     fingerprint_mode = parse_fingerprint_mode(env("FINGERPRINT_MODE", "metadata"))
     local_staging = parse_bool(env("LOCAL_STAGING", "false"), "LOCAL_STAGING")
     local_staging_dir = Path(env("LOCAL_STAGING_DIR", "/tmp/auto-whisper-staging"))
+    overall_output_enabled = parse_bool(env("OVERALL_OUTPUT_ENABLED", "true"), "OVERALL_OUTPUT_ENABLED")
+    overall_output_dir = Path(env("OVERALL_OUTPUT_DIR", "/overall-output"))
     formats = parse_formats("all")
     extensions = parse_list(env("SUPPORTED_EXTENSIONS", ".mp3,.wav,.m4a,.mp4,.mov,.mkv,.webm,.flac,.ogg,.aac,.wma"))
     pairs = parse_input_output_pairs()
@@ -530,6 +572,8 @@ def main() -> int:
         "fingerprint_mode": fingerprint_mode,
         "local_staging": local_staging,
         "local_staging_dir": str(local_staging_dir) if local_staging else "",
+        "overall_output_enabled": overall_output_enabled,
+        "overall_output_dir": str(overall_output_dir) if overall_output_enabled else "",
     }
 
     skipped = 0
@@ -547,6 +591,8 @@ def main() -> int:
             host_output_dirs,
             fingerprint_mode,
             local_staging,
+            overall_output_enabled,
+            overall_output_dir,
         )
         skipped += prepared.skipped
         pending.extend(prepared.pending)
@@ -580,6 +626,15 @@ def main() -> int:
             with transcription_source(item.source_path, local_staging, local_staging_dir) as source_for_transcription:
                 result = model.transcribe(str(source_for_transcription), **options)
             project_outputs = write_outputs(result, item.source_path, item.output_media_path, formats)
+            overall_outputs = copy_overall_outputs(
+                project_outputs,
+                item.source_path,
+                item.display_key,
+                item.pair.id,
+                overall_output_enabled,
+                overall_output_dir,
+                formats,
+            )
             state["files"][item.state_key] = {
                 "status": "complete",
                 "pair_id": item.pair.id,
@@ -593,6 +648,7 @@ def main() -> int:
                 "local_staging": local_staging,
                 "formats": formats,
                 "project_outputs": [str(path) for path in project_outputs],
+                "overall_outputs": [str(path) for path in overall_outputs],
                 "completed_at": datetime.now().isoformat(timespec="seconds"),
             }
             completed += 1

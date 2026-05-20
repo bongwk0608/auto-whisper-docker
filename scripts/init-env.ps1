@@ -14,6 +14,7 @@ $ErrorActionPreference = "Stop"
 $ProjectRoot = Split-Path -Parent (Split-Path -Parent $MyInvocation.MyCommand.Path)
 $EnvPath = Join-Path $ProjectRoot ".env"
 $OverridePath = Join-Path $ProjectRoot "docker-compose.override.yml"
+$OverallOutputPath = Join-Path $ProjectRoot "output_overall"
 
 function Test-CommandExists {
     param([string]$Name)
@@ -136,6 +137,8 @@ foreach ($Path in $OutputDirs) {
     $ResolvedOutputDirs += ConvertTo-ComposePath (Resolve-Path -LiteralPath $Path).Path
 }
 
+New-Item -ItemType Directory -Path $OverallOutputPath -Force | Out-Null
+
 $Device = "cpu"
 $Fp16 = "false"
 $NvidiaVisibleDevices = "void"
@@ -184,6 +187,8 @@ WHISPER_VERBOSE=true
 FINGERPRINT_MODE=metadata
 LOCAL_STAGING=false
 LOCAL_STAGING_DIR=/tmp/auto-whisper-staging
+OVERALL_OUTPUT_ENABLED=true
+OVERALL_OUTPUT_DIR=/overall-output
 SUPPORTED_EXTENSIONS=.mp3,.wav,.m4a,.mp4,.mov,.mkv,.webm,.flac,.ogg,.aac,.wma
 NVIDIA_VISIBLE_DEVICES=$NvidiaVisibleDevices
 NVIDIA_DRIVER_CAPABILITIES=compute,utility

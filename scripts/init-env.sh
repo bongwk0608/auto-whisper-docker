@@ -121,6 +121,7 @@ done
 PROJECT_ROOT="$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)"
 ENV_PATH="$PROJECT_ROOT/.env"
 OVERRIDE_PATH="$PROJECT_ROOT/docker-compose.override.yml"
+OVERALL_OUTPUT_PATH="$PROJECT_ROOT/output_overall"
 
 if [ -n "$SOURCE_LIST_FILE" ]; then
   read_source_list_file "$SOURCE_LIST_FILE"
@@ -180,6 +181,8 @@ while [ "$INDEX" -le "$SOURCE_COUNT" ]; do
   INDEX=$((INDEX + 1))
 done
 
+mkdir -p "$OVERALL_OUTPUT_PATH"
+
 DEVICE="cpu"
 FP16="false"
 NVIDIA_VISIBLE_DEVICES="void"
@@ -225,6 +228,8 @@ WHISPER_VERBOSE=true
 FINGERPRINT_MODE=metadata
 LOCAL_STAGING=false
 LOCAL_STAGING_DIR=/tmp/auto-whisper-staging
+OVERALL_OUTPUT_ENABLED=true
+OVERALL_OUTPUT_DIR=/overall-output
 SUPPORTED_EXTENSIONS=.mp3,.wav,.m4a,.mp4,.mov,.mkv,.webm,.flac,.ogg,.aac,.wma
 NVIDIA_VISIBLE_DEVICES=$NVIDIA_VISIBLE_DEVICES
 NVIDIA_DRIVER_CAPABILITIES=compute,utility

@@ -2,6 +2,7 @@
 input-folders.txt
 docker-compose.override.yml
 output/
+output_overall/
 state/
 test_input/
 models/*

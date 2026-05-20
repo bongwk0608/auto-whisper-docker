@@ -83,7 +83,7 @@ class TranscribeLogicTests(unittest.TestCase):
 
             pair = transcribe.InputOutputPair("pair-001", input_dir, output_dir)
             state = {"version": 1, "runs": {}, "files": {}}
-            prepared = transcribe.prepare_pair(pair, 0, state, ["txt"], [".mp3"], {"model": "base"}, [], [], "metadata", False)
+            prepared = transcribe.prepare_pair(pair, 0, state, ["txt"], [".mp3"], {"model": "base"}, [], [], "metadata", False, True, root / "overall")
             pending = prepared.pending
 
             self.assertEqual(len(pending), 1)
@@ -103,7 +103,7 @@ class TranscribeLogicTests(unittest.TestCase):
 
             pair = transcribe.InputOutputPair("pair-001", input_dir, output_dir)
             state = {"version": 1, "runs": {}, "files": {}, "active_run_ids": {"pair-001": "previous_active_run"}}
-            prepared = transcribe.prepare_pair(pair, 0, state, ["txt"], [".mp3"], {"model": "base"}, [], [], "metadata", False)
+            prepared = transcribe.prepare_pair(pair, 0, state, ["txt"], [".mp3"], {"model": "base"}, [], [], "metadata", False, True, root / "overall")
 
             self.assertEqual(state["active_run_ids"]["pair-001"], "previous_active_run")
             self.assertIsNotNone(prepared.mapping)
@@ -130,6 +130,8 @@ class TranscribeLogicTests(unittest.TestCase):
                 ["/mnt/d/auto_whisper/output"],
                 "metadata",
                 False,
+                True,
+                root / "overall",
             )
 
             run_id = state["active_run_ids"]["pair-001"]
@@ -168,8 +170,8 @@ class TranscribeLogicTests(unittest.TestCase):
             pair_a = transcribe.InputOutputPair("pair-001", input_a, output_root)
             pair_b = transcribe.InputOutputPair("pair-002", input_b, output_root)
 
-            prepared_a = transcribe.prepare_pair(pair_a, 0, state, formats, [".mp3", ".wav"], {"model": "base"}, host_inputs, host_outputs, "metadata", False)
-            prepared_b = transcribe.prepare_pair(pair_b, 1, state, formats, [".mp3", ".wav"], {"model": "base"}, host_inputs, host_outputs, "metadata", False)
+            prepared_a = transcribe.prepare_pair(pair_a, 0, state, formats, [".mp3", ".wav"], {"model": "base"}, host_inputs, host_outputs, "metadata", False, True, root / "overall")
+            prepared_b = transcribe.prepare_pair(pair_b, 1, state, formats, [".mp3", ".wav"], {"model": "base"}, host_inputs, host_outputs, "metadata", False, True, root / "overall")
 
             mappings = [prepared_a.mapping, prepared_b.mapping]
             self.assertEqual([mapping["pair_id"] for mapping in mappings], ["pair-001", "pair-002"])
@@ -183,7 +185,88 @@ class TranscribeLogicTests(unittest.TestCase):
             self.assertEqual(mappings[1]["supported_file_count"], 1)
             self.assertEqual(mappings[1]["source_folder_name"], "UM CS")
             self.assertRegex(mappings[1]["run_id"], r"^UM_CS_created-\d{14}_modified-\d{14}$")
+            self.assertTrue(mappings[1]["overall_output_enabled"])
+            self.assertEqual(mappings[1]["overall_output_root"], str(root / "overall"))
+            self.assertEqual(mappings[1]["overall_pair_output_dir"], str(root / "overall" / "pair-002"))
             self.assertEqual(prepared_b.pending[0].output_media_path.relative_to(output_root / mappings[1]["run_id"]).as_posix(), "course/week1/b.wav")
+
+    def test_overall_output_base_preserves_nested_path_without_run_id(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            source = root / "input" / "Dissertation Discussion" / "STEREO" / "FOLDER01" / "ZOOM0001.WAV"
+            source.parent.mkdir(parents=True)
+            source.write_bytes(b"audio")
+
+            output_base = transcribe.overall_output_base(
+                root / "output_overall",
+                "pair-002",
+                "Dissertation Discussion/STEREO/FOLDER01/ZOOM0001.WAV",
+                source,
+            )
+
+            relative = output_base.relative_to(root / "output_overall" / "pair-002").as_posix()
+            self.assertRegex(relative, r"^Dissertation Discussion/STEREO/FOLDER01/ZOOM0001_created-\d{14}_modified-\d{14}$")
+
+    def test_copy_overall_outputs_copies_multiple_formats_and_overwrites(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            source = root / "input" / "course" / "week1" / "audio.mp3"
+            source.parent.mkdir(parents=True)
+            source.write_bytes(b"audio")
+            project_txt = root / "output" / "run" / "course" / "week1" / "audio_created-1_modified-1.txt"
+            project_json = root / "output" / "run" / "course" / "week1" / "audio_created-1_modified-1.json"
+            project_txt.parent.mkdir(parents=True)
+            project_txt.write_text("new txt", encoding="utf-8")
+            project_json.write_text('{"text":"new"}', encoding="utf-8")
+
+            first_outputs = transcribe.copy_overall_outputs(
+                [project_txt, project_json],
+                source,
+                "course/week1/audio.mp3",
+                "pair-001",
+                True,
+                root / "output_overall",
+                ["txt", "json"],
+            )
+            first_outputs[0].write_text("old txt", encoding="utf-8")
+
+            second_outputs = transcribe.copy_overall_outputs(
+                [project_txt, project_json],
+                source,
+                "course/week1/audio.mp3",
+                "pair-001",
+                True,
+                root / "output_overall",
+                ["txt", "json"],
+            )
+
+            self.assertEqual(first_outputs, second_outputs)
+            self.assertEqual(second_outputs[0].read_text(encoding="utf-8"), "new txt")
+            self.assertEqual(second_outputs[1].read_text(encoding="utf-8"), '{"text":"new"}')
+            self.assertEqual(second_outputs[0].relative_to(root / "output_overall" / "pair-001").parent.as_posix(), "course/week1")
+
+    def test_copy_overall_outputs_disabled_returns_no_paths(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            source = root / "input" / "audio.mp3"
+            project_output = root / "output" / "audio.txt"
+            source.parent.mkdir()
+            source.write_bytes(b"audio")
+            project_output.parent.mkdir()
+            project_output.write_text("text", encoding="utf-8")
+
+            overall_outputs = transcribe.copy_overall_outputs(
+                [project_output],
+                source,
+                "audio.mp3",
+                "pair-001",
+                False,
+                root / "output_overall",
+                ["txt"],
+            )
+
+            self.assertEqual(overall_outputs, [])
+            self.assertFalse((root / "output_overall").exists())
 
     def test_write_mapping_manifests_writes_json_and_csv(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -203,6 +286,9 @@ class TranscribeLogicTests(unittest.TestCase):
                     "formats": "txt,json",
                     "fingerprint_mode": "metadata",
                     "local_staging": False,
+                    "overall_output_enabled": True,
+                    "overall_output_root": "/overall-output",
+                    "overall_pair_output_dir": "/overall-output/pair-001",
                     "recursive_scan_enabled": True,
                     "supported_file_count": 2,
                     "updated_at": "2026-05-20T12:05:00",
@@ -215,6 +301,7 @@ class TranscribeLogicTests(unittest.TestCase):
             csv_text = (output_root / "input-output-mapping.csv").read_text(encoding="utf-8")
             self.assertEqual(manifest["mappings"][0]["pair_id"], "pair-001")
             self.assertIn("recursive_scan_enabled", csv_text)
+            self.assertIn("overall_pair_output_dir", csv_text)
             self.assertIn("pair-001", csv_text)
 
     def test_metadata_fingerprint_does_not_include_sha256(self) -> None:
