@@ -357,6 +357,67 @@ class TranscribeLogicTests(unittest.TestCase):
             self.assertFalse(transcribe.is_complete(record, {"size": 6, "mtime_ns": 123}, ["txt"]))
             self.assertFalse(transcribe.is_complete(record, {"size": 5, "mtime_ns": 124}, ["txt"]))
 
+    def test_skipped_no_audio_is_terminal_for_matching_fingerprint_and_formats(self) -> None:
+        fingerprint = {"size": 5, "mtime_ns": 123}
+        record = {
+            "status": "skipped_no_audio",
+            "fingerprint": fingerprint,
+            "formats": ["txt", "json"],
+        }
+
+        self.assertTrue(transcribe.is_skipped_no_audio(record, fingerprint, ["json", "txt"]))
+        self.assertTrue(transcribe.is_terminal_record(record, fingerprint, ["txt", "json"]))
+
+    def test_skipped_no_audio_retries_when_fingerprint_changes(self) -> None:
+        record = {
+            "status": "skipped_no_audio",
+            "fingerprint": {"size": 5, "mtime_ns": 123},
+            "formats": ["txt"],
+        }
+
+        self.assertFalse(transcribe.is_skipped_no_audio(record, {"size": 6, "mtime_ns": 123}, ["txt"]))
+        self.assertFalse(transcribe.is_terminal_record(record, {"size": 5, "mtime_ns": 124}, ["txt"]))
+
+    def test_prepare_pair_skips_no_audio_records(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            input_dir = root / "input"
+            output_dir = root / "output"
+            media = input_dir / "video.mp4"
+            input_dir.mkdir()
+            media.write_bytes(b"video")
+            fingerprint = transcribe.file_fingerprint(media, "metadata")
+            state = {
+                "version": 1,
+                "runs": {},
+                "files": {
+                    "pair-001:video.mp4": {
+                        "status": "skipped_no_audio",
+                        "fingerprint": fingerprint,
+                        "formats": ["txt"],
+                    }
+                },
+            }
+
+            pair = transcribe.InputOutputPair("pair-001", input_dir, output_dir)
+            prepared = transcribe.prepare_pair(pair, 0, state, ["txt"], [".mp4"], {"model": "base"}, [], [], "metadata", False, True, root / "overall")
+
+            self.assertEqual(prepared.skipped, 0)
+            self.assertEqual(prepared.skipped_no_audio, 1)
+            self.assertEqual(prepared.pending, [])
+
+    def test_no_audio_error_detection_matches_ffmpeg_message(self) -> None:
+        error = RuntimeError("Failed to load audio: Output file #0 does not contain any stream")
+
+        self.assertTrue(transcribe.is_no_audio_error(error))
+        self.assertFalse(transcribe.is_no_audio_error(RuntimeError("Permission denied while reading file")))
+
+    def test_default_supported_extensions_include_common_video_formats(self) -> None:
+        extensions = transcribe.parse_list(transcribe.DEFAULT_SUPPORTED_EXTENSIONS)
+
+        for extension in [".mp4", ".m4v", ".mov", ".mkv", ".webm", ".avi", ".wmv", ".flv", ".ts", ".mts", ".m2ts", ".3gp", ".3g2", ".mpg", ".mpeg", ".vob", ".ogv"]:
+            self.assertIn(extension, extensions)
+
     def test_transcription_source_stages_and_cleans_pending_file(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)

@@ -189,7 +189,7 @@ LOCAL_STAGING=false
 LOCAL_STAGING_DIR=/tmp/auto-whisper-staging
 OVERALL_OUTPUT_ENABLED=true
 OVERALL_OUTPUT_DIR=/overall-output
-SUPPORTED_EXTENSIONS=.mp3,.wav,.m4a,.mp4,.mov,.mkv,.webm,.flac,.ogg,.aac,.wma
+SUPPORTED_EXTENSIONS=.mp3,.wav,.m4a,.flac,.ogg,.aac,.wma,.mp4,.m4v,.mov,.mkv,.webm,.avi,.wmv,.flv,.ts,.mts,.m2ts,.3gp,.3g2,.mpg,.mpeg,.vob,.ogv
 NVIDIA_VISIBLE_DEVICES=$NvidiaVisibleDevices
 NVIDIA_DRIVER_CAPABILITIES=compute,utility
 "@ | Set-Content -LiteralPath $EnvPath -Encoding UTF8

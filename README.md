@@ -47,6 +47,75 @@ sh ./scripts/init-env.sh --source-list-file ./input-folders.txt
 
 The helper writes both `.env` and `docker-compose.override.yml`. The override file contains local folder bind mounts and is ignored by Git.
 
+## Windows Network Drive Auto-Mount
+
+Use this path when Docker Desktop or other Windows apps need mapped network drive letters such as `X:`, `Y:`, and `Z:`.
+
+Mount the default Auto Whisper network drives manually:
+
+```powershell
+.\scripts\mount-windows-network-drives.ps1
+```
+
+By default, the helper maps `X:` to `\\10.0.0.3\smb_backup`, `Y:` to `\\10.0.0.3\smb_documents`, and `Z:` to `\\10.0.0.3\smb_media`. To override the mappings:
+
+```powershell
+.\scripts\mount-windows-network-drives.ps1 -Mappings @{
+  X = "\\10.0.0.3\smb_backup"
+  Y = "\\10.0.0.3\smb_documents"
+  Z = "\\10.0.0.3\smb_media"
+}
+```
+
+The helper uses your existing Windows credentials. Sign in with a domain account that can access the shares, save credentials in Windows Credential Manager, or connect once through File Explorer before relying on unattended startup.
+
+To inspect the current mapping state without changing anything:
+
+```powershell
+cd D:\auto_whisper
+.\scripts\mount-windows-network-drives.ps1 -Diagnose
+```
+
+The diagnosis reports the current Windows user context, whether PowerShell is elevated, the Scheduled Task action, and each configured drive as `Ready`, `Missing`, `Unreachable`, or `Conflict`. If normal and Administrator PowerShell disagree, run `-Diagnose` in both sessions; Windows can keep separate mapped-drive state for those contexts.
+
+If a configured drive letter is already mapped to the same server by hostname instead of IP, run a one-time repair to remove that conflicting mapping and recreate it with the configured IP path:
+
+```powershell
+cd D:\auto_whisper
+.\scripts\mount-windows-network-drives.ps1 -RepairConflicts -RetryCount 1
+net use Y:
+```
+
+For `Y:`, the remote name should be `\\10.0.0.3\smb_documents`.
+
+If Windows still reports that the drive letter has a remembered connection, rerun the repair command from PowerShell as Administrator.
+
+Install automatic mounting for Windows startup, user logon, and reconnect recovery:
+
+```powershell
+.\scripts\mount-windows-network-drives.ps1 -InstallTask
+```
+
+The installed task also runs every 1 minute with a quick check so mapped drives can recover after later Wi-Fi, LAN, VPN, or SMB reconnects. Healthy drives are skipped without remapping.
+
+The scheduled task starts PowerShell hidden so the recovery check runs quietly in the background.
+
+To use a different recovery interval:
+
+```powershell
+.\scripts\mount-windows-network-drives.ps1 -InstallTask -RepeatMinutes 5
+```
+
+If Windows refuses to register the startup trigger, rerun the install command from an elevated PowerShell session.
+
+Remove the automatic mounting task:
+
+```powershell
+.\scripts\mount-windows-network-drives.ps1 -UninstallTask
+```
+
+Windows drive letters are scoped to user sessions. The logon trigger is what makes mapped drives visible to Explorer, Docker Desktop, and normal PowerShell sessions; the startup trigger is best-effort coverage while Windows is booting.
+
 ## Windows WSL Docker Engine Setup
 
 Use this path when Docker Engine is installed inside your WSL distro and you are not using Docker Desktop for Windows.
@@ -373,7 +442,7 @@ When multiple input folders share the same output root, each input still gets it
 
 Progress is stored in `state/progress.json`, which is ignored by Git.
 
-If a run is interrupted, run Compose again. Completed files are skipped when the source fingerprint and expected outputs still match. Failed files are recorded and retried on the next run. Each input/output pair reuses its active timestamped output folder while a run is incomplete.
+If a run is interrupted, run Compose again. Completed files are skipped when the source fingerprint and expected outputs still match. Video-only files with no usable audio stream are recorded and skipped on later runs unless the source file changes. Failed files are recorded and retried on the next run. Each input/output pair reuses its active timestamped output folder while a run is incomplete.
 
 By default, `FINGERPRINT_MODE=metadata` uses file size and modified timestamp for fast skip checks, which is much faster for large network-drive folders. Set `FINGERPRINT_MODE=sha256` if you want the older maximum-safety behavior that reads each supported file fully before deciding whether to skip it.
 
@@ -401,7 +470,7 @@ Important `.env` values:
 - `LOCAL_STAGING_DIR`: staging directory used when `LOCAL_STAGING=true`
 - `OVERALL_OUTPUT_ENABLED`: `true` to copy transcript outputs into merged `output_overall/pair-###/` folders
 - `OVERALL_OUTPUT_DIR`: container path for the merged overall output, normally `/overall-output`
-- `SUPPORTED_EXTENSIONS`: comma-separated file extensions to scan
+- `SUPPORTED_EXTENSIONS`: comma-separated file extensions to scan; defaults to `.mp3,.wav,.m4a,.flac,.ogg,.aac,.wma,.mp4,.m4v,.mov,.mkv,.webm,.avi,.wmv,.flv,.ts,.mts,.m2ts,.3gp,.3g2,.mpg,.mpeg,.vob,.ogv`
 
 Recommended defaults:
 
@@ -475,6 +544,8 @@ WHISPER_MODEL=base
 If it still fails, use CPU mode. CPU mode is slower but has the broadest platform compatibility.
 
 On Apple Silicon Macs, Docker runs Linux ARM containers. Use the CPU image and avoid the CUDA profile.
+
+Video-only files are skipped when FFmpeg reports no usable audio stream. If a file should contain audio but is skipped, verify it with a media player or `ffprobe` and check whether the source file has a valid audio track.
 
 ## GitHub Safety
 

@@ -19,6 +19,10 @@ from whisper.utils import get_writer
 
 
 ALL_FORMATS = ["txt", "json", "tsv", "srt", "vtt"]
+DEFAULT_SUPPORTED_EXTENSIONS = (
+    ".mp3,.wav,.m4a,.flac,.ogg,.aac,.wma,"
+    ".mp4,.m4v,.mov,.mkv,.webm,.avi,.wmv,.flv,.ts,.mts,.m2ts,.3gp,.3g2,.mpg,.mpeg,.vob,.ogv"
+)
 
 
 class InputOutputPair(NamedTuple):
@@ -40,6 +44,7 @@ class PendingFile(NamedTuple):
 
 class PreparedPair(NamedTuple):
     skipped: int
+    skipped_no_audio: int
     pending: list[PendingFile]
     mapping: dict[str, Any] | None
 
@@ -259,6 +264,32 @@ def is_complete(record: dict[str, Any] | None, fingerprint: dict[str, Any], form
     return bool(project_outputs) and outputs_exist(project_outputs)
 
 
+def is_skipped_no_audio(record: dict[str, Any] | None, fingerprint: dict[str, Any], formats: list[str]) -> bool:
+    if not record or record.get("status") != "skipped_no_audio":
+        return False
+    if not fingerprint_matches(record.get("fingerprint"), fingerprint):
+        return False
+    return sorted(record.get("formats", [])) == sorted(formats)
+
+
+def is_terminal_record(record: dict[str, Any] | None, fingerprint: dict[str, Any], formats: list[str]) -> bool:
+    return is_complete(record, fingerprint, formats) or is_skipped_no_audio(record, fingerprint, formats)
+
+
+def is_no_audio_error(error: BaseException) -> bool:
+    message = str(error).lower()
+    patterns = [
+        "output file #0 does not contain any stream",
+        "does not contain any stream",
+        "does not contain an audio stream",
+        "no audio stream",
+        "audio stream missing",
+        "missing audio stream",
+        "no audio",
+    ]
+    return any(pattern in message for pattern in patterns)
+
+
 def choose_device(requested: str) -> str:
     requested = requested.lower()
     if requested == "auto":
@@ -381,6 +412,29 @@ def mark_failure(
     }
 
 
+def mark_no_audio_skip(
+    state: dict[str, Any],
+    key: str,
+    pair_id: str,
+    fingerprint: dict[str, Any],
+    fingerprint_mode: str,
+    local_staging: bool,
+    formats: list[str],
+    error: BaseException,
+) -> None:
+    state["files"][key] = {
+        "status": "skipped_no_audio",
+        "pair_id": pair_id,
+        "fingerprint": fingerprint,
+        "fingerprint_mode": fingerprint_mode,
+        "local_staging": local_staging,
+        "formats": formats,
+        "reason": "No usable audio stream was detected.",
+        "error": str(error),
+        "updated_at": datetime.now().isoformat(timespec="seconds"),
+    }
+
+
 def host_path_for_pair(values: list[str], index: int) -> str:
     return values[index] if index < len(values) else ""
 
@@ -477,7 +531,7 @@ def prepare_pair(
     files = scan_files(pair.input_dir, extensions)
     print(f"Found {len(files)} supported file(s) under {pair.input_dir}.", flush=True)
     if not files:
-        return PreparedPair(0, [], None)
+        return PreparedPair(0, 0, [], None)
 
     active_run_ids = state.setdefault("active_run_ids", {})
     active_run_id = active_run_ids.get(pair.id)
@@ -517,6 +571,7 @@ def prepare_pair(
     )
 
     skipped = 0
+    skipped_no_audio = 0
     pending: list[PendingFile] = []
 
     for index, source_path in enumerate(files, start=1):
@@ -530,15 +585,19 @@ def prepare_pair(
             skipped += 1
             print(f"{pair.id} [{index}/{len(files)}] Skipping complete file: {relative_key}", flush=True)
             continue
+        if is_skipped_no_audio(state["files"].get(key), fingerprint, formats):
+            skipped_no_audio += 1
+            print(f"{pair.id} [{index}/{len(files)}] Skipping no-audio file: {relative_key}", flush=True)
+            continue
 
         pending.append(PendingFile(pair, index, len(files), source_path, project_media_path, key, relative_key, fingerprint))
 
     if not pending:
         active_run_ids.pop(pair.id, None)
         state["runs"][run_key]["completed_at"] = datetime.now().isoformat(timespec="seconds")
-        print(f"{pair.id} done. Completed: 0. Skipped: {skipped}. Failed: 0. Output: {run_output_dir}", flush=True)
+        print(f"{pair.id} done. Completed: 0. Skipped: {skipped}. Skipped no-audio: {skipped_no_audio}. Failed: 0. Output: {run_output_dir}", flush=True)
 
-    return PreparedPair(skipped, pending, mapping)
+    return PreparedPair(skipped, skipped_no_audio, pending, mapping)
 
 
 def main() -> int:
@@ -555,7 +614,7 @@ def main() -> int:
     overall_output_enabled = parse_bool(env("OVERALL_OUTPUT_ENABLED", "true"), "OVERALL_OUTPUT_ENABLED")
     overall_output_dir = Path(env("OVERALL_OUTPUT_DIR", "/overall-output"))
     formats = parse_formats("all")
-    extensions = parse_list(env("SUPPORTED_EXTENSIONS", ".mp3,.wav,.m4a,.mp4,.mov,.mkv,.webm,.flac,.ogg,.aac,.wma"))
+    extensions = parse_list(env("SUPPORTED_EXTENSIONS", DEFAULT_SUPPORTED_EXTENSIONS))
     pairs = parse_input_output_pairs()
     validate_pairs(pairs)
     host_input_dirs = parse_path_list(env("SOURCE_DIRS"))
@@ -577,6 +636,7 @@ def main() -> int:
     }
 
     skipped = 0
+    skipped_no_audio = 0
     pending: list[PendingFile] = []
     mappings: list[dict[str, Any]] = []
     for pair_index, pair in enumerate(pairs):
@@ -595,6 +655,7 @@ def main() -> int:
             overall_output_dir,
         )
         skipped += prepared.skipped
+        skipped_no_audio += prepared.skipped_no_audio
         pending.extend(prepared.pending)
         if prepared.mapping:
             mappings.append(prepared.mapping)
@@ -602,7 +663,7 @@ def main() -> int:
     write_mapping_manifests([pair.output_dir for pair in pairs], mappings)
     atomic_write_json(state_path, state)
     if not pending:
-        print(f"Done. Completed: 0. Skipped: {skipped}. Failed: 0.", flush=True)
+        print(f"Done. Completed: 0. Skipped: {skipped}. Skipped no-audio: {skipped_no_audio}. Failed: 0.", flush=True)
         return 0
 
     device = choose_device(env("WHISPER_DEVICE", "auto"))
@@ -653,9 +714,14 @@ def main() -> int:
             }
             completed += 1
         except Exception as exc:
-            failed += 1
-            print(f"Failed: {item.pair.id}:{item.display_key}: {exc}", file=sys.stderr, flush=True)
-            mark_failure(state, item.state_key, item.fingerprint, fingerprint_mode, local_staging, exc)
+            if is_no_audio_error(exc):
+                skipped_no_audio += 1
+                print(f"Skipped no-audio: {item.pair.id}:{item.display_key}: {exc}", file=sys.stderr, flush=True)
+                mark_no_audio_skip(state, item.state_key, item.pair.id, item.fingerprint, fingerprint_mode, local_staging, formats, exc)
+            else:
+                failed += 1
+                print(f"Failed: {item.pair.id}:{item.display_key}: {exc}", file=sys.stderr, flush=True)
+                mark_failure(state, item.state_key, item.fingerprint, fingerprint_mode, local_staging, exc)
         finally:
             run_id = state["active_run_ids"].get(item.pair.id)
             run_key = state_run_key(item.pair.id, run_id) if run_id else ""
@@ -666,7 +732,11 @@ def main() -> int:
     for pair in pairs:
         files = scan_files(pair.input_dir, extensions)
         incomplete = any(
-            state["files"].get(f"{pair.id}:{path.relative_to(pair.input_dir).as_posix()}", {}).get("status") != "complete"
+            not is_terminal_record(
+                state["files"].get(f"{pair.id}:{path.relative_to(pair.input_dir).as_posix()}"),
+                file_fingerprint(path, fingerprint_mode),
+                formats,
+            )
             for path in files
         )
         run_id = state.get("active_run_ids", {}).get(pair.id)
@@ -680,7 +750,7 @@ def main() -> int:
     atomic_write_json(state_path, state)
 
     print(
-        f"Done. Completed: {completed}. Skipped: {skipped}. Failed: {failed}.",
+        f"Done. Completed: {completed}. Skipped: {skipped}. Skipped no-audio: {skipped_no_audio}. Failed: {failed}.",
         flush=True,
     )
     return 1 if failed else 0
