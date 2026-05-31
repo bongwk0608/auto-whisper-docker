@@ -56,10 +56,25 @@ class PyannoteDiarizationBackend:
         else:
             progress_reporter.update("pyannote inference", force=True)
             diarization = self.run_pipeline_with_progress(pipeline, audio_path, kwargs, progress_reporter)
+        annotation = self.unwrap_diarization_output(diarization)
         segments: list[SpeakerSegment] = []
-        for turn, _track, speaker in diarization.itertracks(yield_label=True):
+        for turn, _track, speaker in annotation.itertracks(yield_label=True):
             segments.append(SpeakerSegment(float(turn.start), float(turn.end), str(speaker)))
         return sorted(segments, key=lambda item: (item.start, item.end, item.speaker_label))
+
+    def unwrap_diarization_output(self, diarization: Any) -> Any:
+        if hasattr(diarization, "itertracks"):
+            return diarization
+        for attr in ("speaker_diarization", "diarization", "annotation"):
+            value = getattr(diarization, attr, None)
+            if value is not None and hasattr(value, "itertracks"):
+                return value
+        if isinstance(diarization, dict):
+            for key in ("speaker_diarization", "diarization", "annotation"):
+                value = diarization.get(key)
+                if value is not None and hasattr(value, "itertracks"):
+                    return value
+        raise TypeError(f"Pyannote output does not contain an iterable diarization annotation: {type(diarization).__name__}")
 
     def run_pipeline_with_progress(
         self,
@@ -73,8 +88,8 @@ class PyannoteDiarizationBackend:
         except ImportError:
             return pipeline(str(audio_path), hook=ProjectProgressHook(progress_reporter), **kwargs)
 
-        with ProgressHook() as hook:
-            return pipeline(str(audio_path), hook=ProjectProgressHook(progress_reporter, hook), **kwargs)
+        with ProgressHook():
+            return pipeline(str(audio_path), hook=ProjectProgressHook(progress_reporter), **kwargs)
 
     def load_pipeline(self) -> tuple[Any, Any]:
         try:

@@ -10,6 +10,7 @@ from diarization.export_speaker_transcript import export_speaker_outputs, output
 from diarization.filename_normalization import normalize_filename, unique_normalized_filename
 from diarization.merge_whisper_speakers import MULTI_SPEAKER_POSSIBLE, assign_speakers_to_whisper_segments
 from diarization.progress import DiarizationProgressReporter, ProgressContext, format_duration
+from diarization.pyannote_runner import PyannoteDiarizationBackend
 from diarization.raw_cache import cache_key, load_cached_segments, save_cached_segments
 from scripts.backfill_diarization import process_transcript_set
 
@@ -196,6 +197,18 @@ class DiarizationLogicTests(unittest.TestCase):
         self.assertTrue(reporter.update("pyannote segmentation", current=2, total=100))
         self.assertFalse(reporter.update("pyannote segmentation", current=2, total=100))
         self.assertTrue(reporter.update("pyannote segmentation", current=2, total=100))
+
+    def test_pyannote_backend_unwraps_community_output(self) -> None:
+        class Annotation:
+            def itertracks(self, yield_label: bool = False):
+                return iter(())
+
+        class DiarizeOutput:
+            speaker_diarization = Annotation()
+
+        backend = PyannoteDiarizationBackend.__new__(PyannoteDiarizationBackend)
+
+        self.assertIs(backend.unwrap_diarization_output(DiarizeOutput()), DiarizeOutput.speaker_diarization)
 
 
 if __name__ == "__main__":
