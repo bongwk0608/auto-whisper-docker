@@ -5,6 +5,7 @@ from pathlib import Path
 from typing import Any
 
 from diarization.backend import DiarizationConfig, SpeakerSegment
+from diarization.progress import DiarizationProgressReporter, ProjectProgressHook
 
 
 class PyannoteModelAccessError(RuntimeError):
@@ -35,7 +36,7 @@ class PyannoteDiarizationBackend:
         if not self.auth_token:
             raise RuntimeError("PYANNOTE_AUTH_TOKEN is required for pyannote diarization.")
 
-    def diarize(self, audio_path: Path) -> list[SpeakerSegment]:
+    def diarize(self, audio_path: Path, progress_reporter: DiarizationProgressReporter | None = None) -> list[SpeakerSegment]:
         pipeline, torch = self.load_pipeline()
         target_device = self.device or ("cuda" if torch.cuda.is_available() else "cpu")
         if hasattr(pipeline, "to"):
@@ -50,11 +51,30 @@ class PyannoteDiarizationBackend:
         if self.config.max_speakers is not None:
             kwargs["max_speakers"] = self.config.max_speakers
 
-        diarization = pipeline(str(audio_path), **kwargs)
+        if progress_reporter is None:
+            diarization = pipeline(str(audio_path), **kwargs)
+        else:
+            progress_reporter.update("pyannote inference", force=True)
+            diarization = self.run_pipeline_with_progress(pipeline, audio_path, kwargs, progress_reporter)
         segments: list[SpeakerSegment] = []
         for turn, _track, speaker in diarization.itertracks(yield_label=True):
             segments.append(SpeakerSegment(float(turn.start), float(turn.end), str(speaker)))
         return sorted(segments, key=lambda item: (item.start, item.end, item.speaker_label))
+
+    def run_pipeline_with_progress(
+        self,
+        pipeline: Any,
+        audio_path: Path,
+        kwargs: dict[str, int],
+        progress_reporter: DiarizationProgressReporter,
+    ) -> Any:
+        try:
+            from pyannote.audio.pipelines.utils.hook import ProgressHook
+        except ImportError:
+            return pipeline(str(audio_path), hook=ProjectProgressHook(progress_reporter), **kwargs)
+
+        with ProgressHook() as hook:
+            return pipeline(str(audio_path), hook=ProjectProgressHook(progress_reporter, hook), **kwargs)
 
     def load_pipeline(self) -> tuple[Any, Any]:
         try:

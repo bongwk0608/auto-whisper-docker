@@ -469,6 +469,7 @@ Set a Hugging Face token that can access the pyannote model:
 PYANNOTE_AUTH_TOKEN=hf_...
 DIARIZATION_MODEL=pyannote/speaker-diarization-community-1
 DIARIZATION_VERBOSE=false
+DIARIZATION_PROGRESS=
 DIARIZATION_TF32=false
 PYANNOTE_METRICS_ENABLED=0
 ```
@@ -480,6 +481,14 @@ PYANNOTE_METRICS_ENABLED=0
 - `auto` leaves the current PyTorch/pyannote setting unchanged.
 
 Pyannote's TF32 reproducibility warning is not a crash. If you enable TF32 intentionally, expect a speed/reproducibility tradeoff. `DIARIZATION_VERBOSE=true` prints project-level progress and timing such as path resolution, cache hits, inference timing, merge, and export steps; it does not enable internal pyannote debug logs.
+
+`DIARIZATION_PROGRESS` controls live pyannote stage progress:
+
+- Empty/default follows `DIARIZATION_VERBOSE`, so verbose runs show progress automatically.
+- `true` enables file-level pyannote progress, percentage when pyannote exposes totals, elapsed time, and ETA when enough data exists.
+- `false` disables live progress lines.
+
+Pyannote does not diarize Whisper transcript lines one by one. During inference, progress is file-level and pyannote-stage-level, such as segmentation, embedding, and clustering. After inference finishes, the project logs the merge back into Whisper segments.
 
 Build and run the separate CUDA diarization service manually:
 
@@ -505,7 +514,8 @@ Useful options:
 ```sh
 python scripts/backfill_diarization.py --dry-run
 python scripts/backfill_diarization.py --force
-python scripts/backfill_diarization.py --verbose --tf32 false
+python scripts/backfill_diarization.py --verbose --progress --tf32 false
+python scripts/backfill_diarization.py --no-progress
 python scripts/backfill_diarization.py --min-overlap-ratio 0.3 --min-speakers 1 --max-speakers 5
 ```
 
@@ -591,6 +601,7 @@ Important `.env` values:
 - `WHISPER_CONDITION_ON_PREVIOUS_TEXT`: `true` or `false`
 - `WHISPER_VERBOSE`: `true` or `false`
 - `DIARIZATION_VERBOSE`: `true` for project-level pyannote progress/timing logs, or `false`
+- `DIARIZATION_PROGRESS`: empty to follow `DIARIZATION_VERBOSE`, `true` for live pyannote stage progress with percentage/ETA when available, or `false`
 - `DIARIZATION_TF32`: `false` for reproducible pyannote CUDA output, `true` for faster TF32 inference, or `auto` to leave PyTorch defaults unchanged
 - `FINGERPRINT_MODE`: `metadata` for fast network-drive skip checks, or `sha256` for full-file hashing
 - `LOCAL_STAGING`: `true` to copy only pending files to local temporary storage before transcription

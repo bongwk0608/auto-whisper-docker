@@ -15,6 +15,7 @@ if str(ROOT) not in sys.path:
 from diarization.backend import DiarizationConfig
 from diarization.export_speaker_transcript import output_base_for_whisper_json, speaker_outputs_complete
 from diarization.manifest import load_manifest, manifest_key, save_manifest, update_job
+from diarization.progress import ProgressContext, parse_progress_enabled
 from diarization.pyannote_runner import PyannoteModelAccessError, PyannoteDiarizationBackend, parse_tf32_mode
 from scripts.run_diarization import parse_bool, parse_optional_int, run_single_diarization
 
@@ -140,11 +141,13 @@ def process_transcript_set(
     dry_run: bool,
     verbose: bool = False,
     tf32_mode: str = "false",
+    progress: bool = False,
 ) -> tuple[int, int, int, int]:
     completed = 0
     skipped = 0
     missing_audio = 0
     failed = 0
+    entries: list[tuple[Path, Path, str, Path | None]] = []
 
     for whisper_json in iter_whisper_json_files(transcripts_dir):
         output_base = output_base_for_whisper_json(whisper_json, transcripts_dir, output_dir)
@@ -152,7 +155,16 @@ def process_transcript_set(
         audio_path = audio_lookup.get(str(whisper_json.resolve()))
         if audio_path is None:
             audio_path = discover_audio_from_audio_dir(whisper_json, transcripts_dir, audio_dir)
+        entries.append((whisper_json, output_base, key, audio_path))
 
+    processable_total = sum(
+        1
+        for _whisper_json, output_base, _key, audio_path in entries
+        if (force or not speaker_outputs_complete(output_base)) and audio_path is not None and audio_path.exists()
+    )
+    processable_index = 0
+
+    for whisper_json, output_base, key, audio_path in entries:
         print(f"Processing Whisper JSON: {whisper_json}", flush=True)
         if verbose:
             print(f"Resolved output base: {output_base}", flush=True)
@@ -171,6 +183,7 @@ def process_transcript_set(
             print(f"Skipped missing audio for: {whisper_json}", flush=True)
             continue
 
+        processable_index += 1
         if dry_run:
             update_job(manifest, key, "pending", whisper_json, output_base, audio_path)
             print(f"Would process: audio={audio_path} whisper={whisper_json} output={output_base}", flush=True)
@@ -188,6 +201,8 @@ def process_transcript_set(
                 dry_run=False,
                 verbose=verbose,
                 tf32_mode=tf32_mode,
+                progress=progress,
+                progress_context=ProgressContext(file_index=processable_index, file_total=processable_total),
             )
             completed += 1
             update_job(manifest, key, "completed", whisper_json, output_base, audio_path, output_paths, cache_hit=cache_hit)
@@ -221,6 +236,9 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--max-speakers", type=int, default=parse_optional_int(os.environ.get("DIARIZATION_MAX_SPEAKERS")))
     parser.add_argument("--tf32", choices=["auto", "true", "false"], default=parse_tf32_mode(os.environ.get("DIARIZATION_TF32")))
     parser.add_argument("--verbose", action="store_true", default=parse_bool(os.environ.get("DIARIZATION_VERBOSE"), False))
+    progress_default = parse_progress_enabled(os.environ.get("DIARIZATION_PROGRESS"), parse_bool(os.environ.get("DIARIZATION_VERBOSE"), False))
+    parser.add_argument("--progress", dest="progress", action="store_true", default=progress_default)
+    parser.add_argument("--no-progress", dest="progress", action="store_false")
     parser.add_argument("--force", action="store_true")
     parser.add_argument("--dry-run", action="store_true")
     return parser
@@ -235,7 +253,8 @@ def main() -> int:
 
     config = DiarizationConfig(args.backend, args.model, args.num_speakers, args.min_speakers, args.max_speakers)
     print(
-        f"Diarization startup: model={config.model} verbose={args.verbose} tf32={args.tf32} dry_run={args.dry_run}",
+        f"Diarization startup: model={config.model} verbose={args.verbose} "
+        f"progress={args.progress and not args.dry_run} tf32={args.tf32} dry_run={args.dry_run}",
         flush=True,
     )
     if not args.dry_run:
@@ -267,6 +286,7 @@ def main() -> int:
             args.dry_run,
             args.verbose,
             args.tf32,
+            args.progress and not args.dry_run,
         )
         totals[0] += completed
         totals[1] += skipped

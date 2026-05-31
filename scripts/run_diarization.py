@@ -15,6 +15,7 @@ if str(ROOT) not in sys.path:
 from diarization.backend import DiarizationConfig, SpeakerSegment
 from diarization.export_speaker_transcript import export_speaker_outputs, speaker_outputs_complete
 from diarization.merge_whisper_speakers import MergeConfig, assign_speakers_to_whisper_segments
+from diarization.progress import DiarizationProgressReporter, ProgressContext, parse_progress_enabled
 from diarization.pyannote_runner import PyannoteDiarizationBackend, parse_tf32_mode
 from diarization.raw_cache import cache_key, load_cached_segments, save_cached_segments
 
@@ -50,6 +51,8 @@ def run_single_diarization(
     dry_run: bool = False,
     verbose: bool = False,
     tf32_mode: str | None = None,
+    progress: bool = False,
+    progress_context: ProgressContext | None = None,
 ) -> tuple[dict[str, Path], bool]:
     started_at = time.perf_counter()
     if speaker_outputs_complete(output_base) and not force:
@@ -74,7 +77,8 @@ def run_single_diarization(
         if verbose:
             print(f"Starting Pyannote inference: model={config.model} audio={audio_path}", flush=True)
         inference_started_at = time.perf_counter()
-        speaker_segments = backend.diarize(audio_path)
+        progress_reporter = DiarizationProgressReporter(progress_context) if progress else None
+        speaker_segments = backend.diarize(audio_path, progress_reporter=progress_reporter)
         if verbose:
             elapsed = time.perf_counter() - inference_started_at
             print(f"Finished Pyannote inference: speakers={len({segment.speaker_label for segment in speaker_segments})} segments={len(speaker_segments)} elapsed={elapsed:.1f}s", flush=True)
@@ -83,7 +87,11 @@ def run_single_diarization(
             print(f"Saved raw diarization cache: {cache_dir / (key + '.json')}", flush=True)
 
     if verbose:
-        print(f"Merging speakers into Whisper segments: min_overlap_ratio={min_overlap_ratio}", flush=True)
+        print(f"Merging speakers into Whisper segments: {len(whisper_data['segments'])} segments min_overlap_ratio={min_overlap_ratio}", flush=True)
+    if progress:
+        DiarizationProgressReporter(progress_context).message(
+            f"merging speakers into {len(whisper_data['segments'])} Whisper segments"
+        )
     merged_segments = assign_speakers_to_whisper_segments(
         whisper_data["segments"],
         speaker_segments,
@@ -110,6 +118,9 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--cache-dir", type=Path, default=Path(os.environ.get("DIARIZATION_CACHE_DIR", "state/diarization-cache")))
     parser.add_argument("--tf32", choices=["auto", "true", "false"], default=parse_tf32_mode(os.environ.get("DIARIZATION_TF32")))
     parser.add_argument("--verbose", action="store_true", default=parse_bool(os.environ.get("DIARIZATION_VERBOSE"), False))
+    progress_default = parse_progress_enabled(os.environ.get("DIARIZATION_PROGRESS"), parse_bool(os.environ.get("DIARIZATION_VERBOSE"), False))
+    parser.add_argument("--progress", dest="progress", action="store_true", default=progress_default)
+    parser.add_argument("--no-progress", dest="progress", action="store_false")
     parser.add_argument("--force", action="store_true")
     parser.add_argument("--dry-run", action="store_true")
     return parser
@@ -138,6 +149,8 @@ def main() -> int:
         args.dry_run,
         args.verbose,
         args.tf32,
+        args.progress and not args.dry_run,
+        ProgressContext(file_index=1, file_total=1),
     )
     for name, path in paths.items():
         print(f"{name}: {path}", flush=True)

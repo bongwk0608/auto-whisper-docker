@@ -9,6 +9,7 @@ from diarization.backend import DiarizationConfig, SpeakerSegment
 from diarization.export_speaker_transcript import export_speaker_outputs, output_base_for_whisper_json, speaker_outputs_complete
 from diarization.filename_normalization import normalize_filename, unique_normalized_filename
 from diarization.merge_whisper_speakers import MULTI_SPEAKER_POSSIBLE, assign_speakers_to_whisper_segments
+from diarization.progress import DiarizationProgressReporter, ProgressContext, format_duration
 from diarization.raw_cache import cache_key, load_cached_segments, save_cached_segments
 from scripts.backfill_diarization import process_transcript_set
 
@@ -172,7 +173,30 @@ class DiarizationLogicTests(unittest.TestCase):
 
         self.assertEqual(base.as_posix(), "/tmp/output_pyannote/run/course/week1/audio")
 
+    def test_progress_duration_formats_unknown_and_clock_time(self) -> None:
+        self.assertEqual(format_duration(None), "unknown")
+        self.assertEqual(format_duration(3723), "01:02:03")
+
+    def test_progress_eta_is_unknown_without_total(self) -> None:
+        self.assertIsNone(DiarizationProgressReporter.eta(30.0, current=None, total=100.0))
+        self.assertIsNone(DiarizationProgressReporter.eta(30.0, current=0.0, total=100.0))
+
+    def test_progress_eta_uses_current_and_total(self) -> None:
+        self.assertEqual(DiarizationProgressReporter.eta(30.0, current=25.0, total=100.0), 90.0)
+
+    def test_progress_throttles_repeated_identical_lines(self) -> None:
+        ticks = iter([0.0, 0.0, 1.0, 2.0, 3.0, 13.0])
+        reporter = DiarizationProgressReporter(
+            ProgressContext(file_index=1, file_total=2),
+            clock=lambda: next(ticks),
+        )
+
+        self.assertTrue(reporter.update("pyannote segmentation", current=1, total=100))
+        self.assertFalse(reporter.update("pyannote segmentation", current=1, total=100))
+        self.assertTrue(reporter.update("pyannote segmentation", current=2, total=100))
+        self.assertFalse(reporter.update("pyannote segmentation", current=2, total=100))
+        self.assertTrue(reporter.update("pyannote segmentation", current=2, total=100))
+
 
 if __name__ == "__main__":
     unittest.main()
-
