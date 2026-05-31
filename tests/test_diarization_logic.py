@@ -17,7 +17,7 @@ from diarization.filename_normalization import (
 )
 from diarization.merge_whisper_speakers import MULTI_SPEAKER_POSSIBLE, assign_speakers_to_whisper_segments
 from diarization.progress import DiarizationProgressReporter, ProgressContext, format_duration
-from diarization.pyannote_runner import PyannoteDiarizationBackend, is_cuda_oom_error, parse_oom_fallback
+from diarization.pyannote_runner import PyannoteDiarizationBackend, cleanup_cuda_memory, is_cuda_oom_error, parse_oom_fallback
 from diarization.raw_cache import cache_key, load_cached_segments, save_cached_segments
 from scripts.backfill_diarization import process_transcript_set
 from scripts.run_diarization import run_single_diarization
@@ -252,6 +252,14 @@ class DiarizationLogicTests(unittest.TestCase):
         self.assertTrue(is_cuda_oom_error(RuntimeError("GET was unable to find an engine to execute this computation")))
         self.assertEqual(parse_oom_fallback(None), "cpu")
         self.assertEqual(parse_oom_fallback("skip"), "skip")
+
+    def test_cuda_cleanup_is_best_effort(self) -> None:
+        fake_torch = mock.Mock()
+        fake_torch.cuda.is_available.return_value = True
+        fake_torch.cuda.empty_cache.side_effect = RuntimeError("CUDA error: out of memory")
+
+        with mock.patch.dict("sys.modules", {"torch": fake_torch}):
+            cleanup_cuda_memory(verbose=True)
 
     def test_run_single_diarization_retries_cuda_oom_on_cpu(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:

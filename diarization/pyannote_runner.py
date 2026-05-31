@@ -42,14 +42,18 @@ def cleanup_cuda_memory(verbose: bool = False) -> None:
         import torch
     except ImportError:
         return
-    if not torch.cuda.is_available():
-        return
-    torch.cuda.empty_cache()
-    ipc_collect = getattr(torch.cuda, "ipc_collect", None)
-    if callable(ipc_collect):
-        ipc_collect()
-    if verbose:
-        print("CUDA cleanup completed", flush=True)
+    try:
+        if not torch.cuda.is_available():
+            return
+        torch.cuda.empty_cache()
+        ipc_collect = getattr(torch.cuda, "ipc_collect", None)
+        if callable(ipc_collect):
+            ipc_collect()
+        if verbose:
+            print("CUDA cleanup completed", flush=True)
+    except Exception as exc:
+        if verbose:
+            print(f"CUDA cleanup skipped after error: {exc}", flush=True)
 
 
 class PyannoteDiarizationBackend:
