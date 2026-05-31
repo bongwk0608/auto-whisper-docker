@@ -516,6 +516,28 @@ docker compose --profile diarization run --rm diarization-cuda
 
 Do not keep Whisper and pyannote running on the GPU at the same time. To check WSL and Docker GPU visibility:
 
+You can also run the sequential pipeline with one command. On Windows PowerShell:
+
+```powershell
+.\scripts\run_pipeline.ps1 -Cuda -Diarization
+```
+
+On Linux, macOS, or WSL:
+
+```sh
+sh ./scripts/run_pipeline.sh --cuda --diarization
+```
+
+For a diarization dry run after Whisper:
+
+```powershell
+.\scripts\run_pipeline.ps1 -Cuda -Diarization -DiarizationDryRun
+```
+
+```sh
+sh ./scripts/run_pipeline.sh --cuda --diarization-dry-run
+```
+
 ```sh
 nvidia-smi
 docker run --rm --gpus all nvidia/cuda:12.4.1-base-ubuntu22.04 nvidia-smi
