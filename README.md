@@ -468,8 +468,18 @@ Set a Hugging Face token that can access the pyannote model:
 ```env
 PYANNOTE_AUTH_TOKEN=hf_...
 DIARIZATION_MODEL=pyannote/speaker-diarization-community-1
+DIARIZATION_VERBOSE=false
+DIARIZATION_TF32=false
 PYANNOTE_METRICS_ENABLED=0
 ```
+
+`DIARIZATION_TF32` controls PyTorch TensorFloat-32 behavior for pyannote on CUDA:
+
+- `false` disables TF32 and is the default because pyannote does this for more reproducible speaker labels.
+- `true` enables TF32 and may improve speed on Ampere-class and newer GPUs, but speaker segmentation/assignment can differ between runs or CUDA stacks.
+- `auto` leaves the current PyTorch/pyannote setting unchanged.
+
+Pyannote's TF32 reproducibility warning is not a crash. If you enable TF32 intentionally, expect a speed/reproducibility tradeoff. `DIARIZATION_VERBOSE=true` prints project-level progress and timing such as path resolution, cache hits, inference timing, merge, and export steps; it does not enable internal pyannote debug logs.
 
 Build and run the separate CUDA diarization service manually:
 
@@ -477,6 +487,8 @@ Build and run the separate CUDA diarization service manually:
 docker compose --profile diarization build diarization-cuda
 docker compose --profile diarization run --rm diarization-cuda
 ```
+
+Python files are bind-mounted into `/app` for `diarization-cuda`, so script-only edits do not require rebuilding the image. Rebuild only after dependency or Dockerfile changes.
 
 The service runs `scripts/backfill_diarization.py` by default:
 
@@ -493,6 +505,7 @@ Useful options:
 ```sh
 python scripts/backfill_diarization.py --dry-run
 python scripts/backfill_diarization.py --force
+python scripts/backfill_diarization.py --verbose --tf32 false
 python scripts/backfill_diarization.py --min-overlap-ratio 0.3 --min-speakers 1 --max-speakers 5
 ```
 
@@ -577,6 +590,8 @@ Important `.env` values:
 - `WHISPER_FP16`: `false` for CPU, `auto` for CUDA, or explicit `true`/`false`
 - `WHISPER_CONDITION_ON_PREVIOUS_TEXT`: `true` or `false`
 - `WHISPER_VERBOSE`: `true` or `false`
+- `DIARIZATION_VERBOSE`: `true` for project-level pyannote progress/timing logs, or `false`
+- `DIARIZATION_TF32`: `false` for reproducible pyannote CUDA output, `true` for faster TF32 inference, or `auto` to leave PyTorch defaults unchanged
 - `FINGERPRINT_MODE`: `metadata` for fast network-drive skip checks, or `sha256` for full-file hashing
 - `LOCAL_STAGING`: `true` to copy only pending files to local temporary storage before transcription
 - `LOCAL_STAGING_DIR`: staging directory used when `LOCAL_STAGING=true`

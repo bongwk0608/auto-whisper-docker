@@ -15,7 +15,8 @@ if str(ROOT) not in sys.path:
 from diarization.backend import DiarizationConfig
 from diarization.export_speaker_transcript import output_base_for_whisper_json, speaker_outputs_complete
 from diarization.manifest import load_manifest, manifest_key, save_manifest, update_job
-from scripts.run_diarization import parse_optional_int, run_single_diarization
+from diarization.pyannote_runner import PyannoteModelAccessError, PyannoteDiarizationBackend, parse_tf32_mode
+from scripts.run_diarization import parse_bool, parse_optional_int, run_single_diarization
 
 
 SUPPORTED_AUDIO_EXTENSIONS = [
@@ -46,6 +47,16 @@ SUPPORTED_AUDIO_EXTENSIONS = [
 ]
 
 
+def equivalent_output_paths(path: Path) -> list[Path]:
+    paths = [path]
+    parts = path.parts
+    if len(parts) >= 4 and parts[0] == "/" and parts[1] == "outputs" and parts[2].startswith("output-"):
+        paths.append(ROOT / "output" / Path(*parts[3:]))
+    elif len(parts) >= 3 and parts[0] == "/" and parts[1] == "overall-output":
+        paths.append(ROOT / "output_overall" / Path(*parts[2:]))
+    return paths
+
+
 def load_json_if_exists(path: Path) -> dict[str, Any]:
     if not path.exists():
         return {}
@@ -68,7 +79,8 @@ def build_audio_lookup(state_path: Path) -> dict[str, Path]:
         for output in record.get("project_outputs", []) + record.get("overall_outputs", []):
             output_path = Path(str(output))
             if output_path.suffix.lower() == ".json":
-                lookup[str(output_path.resolve())] = audio_path
+                for equivalent_path in equivalent_output_paths(output_path):
+                    lookup[str(equivalent_path.resolve())] = audio_path
     return lookup
 
 
@@ -126,6 +138,8 @@ def process_transcript_set(
     audio_dir: Path | None,
     force: bool,
     dry_run: bool,
+    verbose: bool,
+    tf32_mode: str,
 ) -> tuple[int, int, int, int]:
     completed = 0
     skipped = 0
@@ -140,6 +154,9 @@ def process_transcript_set(
             audio_path = discover_audio_from_audio_dir(whisper_json, transcripts_dir, audio_dir)
 
         print(f"Processing Whisper JSON: {whisper_json}", flush=True)
+        if verbose:
+            print(f"Resolved output base: {output_base}", flush=True)
+            print(f"Resolved audio path: {audio_path or '<missing>'}", flush=True)
         if speaker_outputs_complete(output_base) and not force:
             skipped += 1
             update_job(manifest, key, "skipped_existing", whisper_json, output_base, audio_path)
@@ -169,6 +186,8 @@ def process_transcript_set(
                 cache_dir,
                 force=force,
                 dry_run=False,
+                verbose=verbose,
+                tf32_mode=tf32_mode,
             )
             completed += 1
             update_job(manifest, key, "completed", whisper_json, output_base, audio_path, output_paths, cache_hit=cache_hit)
@@ -200,6 +219,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--num-speakers", type=int, default=parse_optional_int(os.environ.get("DIARIZATION_NUM_SPEAKERS")))
     parser.add_argument("--min-speakers", type=int, default=parse_optional_int(os.environ.get("DIARIZATION_MIN_SPEAKERS")))
     parser.add_argument("--max-speakers", type=int, default=parse_optional_int(os.environ.get("DIARIZATION_MAX_SPEAKERS")))
+    parser.add_argument("--tf32", choices=["auto", "true", "false"], default=parse_tf32_mode(os.environ.get("DIARIZATION_TF32")))
+    parser.add_argument("--verbose", action="store_true", default=parse_bool(os.environ.get("DIARIZATION_VERBOSE"), False))
     parser.add_argument("--force", action="store_true")
     parser.add_argument("--dry-run", action="store_true")
     return parser
@@ -213,6 +234,17 @@ def main() -> int:
         raise RuntimeError("PYANNOTE_AUTH_TOKEN is required unless --dry-run is used.")
 
     config = DiarizationConfig(args.backend, args.model, args.num_speakers, args.min_speakers, args.max_speakers)
+    print(
+        f"Diarization startup: model={config.model} verbose={args.verbose} tf32={args.tf32} dry_run={args.dry_run}",
+        flush=True,
+    )
+    if not args.dry_run:
+        try:
+            PyannoteDiarizationBackend(config, tf32_mode=args.tf32, verbose=args.verbose).validate_access()
+        except PyannoteModelAccessError as exc:
+            print(f"Pyannote access check failed: {exc}", file=sys.stderr, flush=True)
+            return 2
+
     audio_lookup = build_audio_lookup(args.state_path)
     manifest = load_manifest(args.manifest_path)
 
@@ -233,6 +265,8 @@ def main() -> int:
             args.audio_dir,
             args.force,
             args.dry_run,
+            args.verbose,
+            args.tf32,
         )
         totals[0] += completed
         totals[1] += skipped
@@ -249,4 +283,3 @@ def main() -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
-
