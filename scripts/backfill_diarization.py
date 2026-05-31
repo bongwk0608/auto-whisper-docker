@@ -138,8 +138,8 @@ def process_transcript_set(
     audio_dir: Path | None,
     force: bool,
     dry_run: bool,
-    verbose: bool,
-    tf32_mode: str,
+    verbose: bool = False,
+    tf32_mode: str = "false",
 ) -> tuple[int, int, int, int]:
     completed = 0
     skipped = 0
