@@ -4,15 +4,23 @@ import json
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 from diarization.backend import DiarizationConfig, SpeakerSegment
 from diarization.export_speaker_transcript import export_speaker_outputs, output_base_for_whisper_json, speaker_outputs_complete
-from diarization.filename_normalization import normalize_filename, unique_normalized_filename
+from diarization.filename_normalization import (
+    choose_output_filename,
+    normalize_filename,
+    parse_safe_output_policy,
+    safe_relative_path,
+    unique_normalized_filename,
+)
 from diarization.merge_whisper_speakers import MULTI_SPEAKER_POSSIBLE, assign_speakers_to_whisper_segments
 from diarization.progress import DiarizationProgressReporter, ProgressContext, format_duration
-from diarization.pyannote_runner import PyannoteDiarizationBackend
+from diarization.pyannote_runner import PyannoteDiarizationBackend, is_cuda_oom_error, parse_oom_fallback
 from diarization.raw_cache import cache_key, load_cached_segments, save_cached_segments
 from scripts.backfill_diarization import process_transcript_set
+from scripts.run_diarization import run_single_diarization
 
 
 class DiarizationLogicTests(unittest.TestCase):
@@ -72,6 +80,7 @@ class DiarizationLogicTests(unittest.TestCase):
 
             self.assertTrue(speaker_outputs_complete(base))
             payload = json.loads(paths["speaker_json"].read_text(encoding="utf-8"))
+            self.assertEqual(payload["filename_policy"], "auto")
             self.assertEqual(payload["segments"][0]["assigned_speaker"], "Speaker_00")
             self.assertIn("Speaker_00: hello", paths["speaker_srt"].read_text(encoding="utf-8"))
             self.assertIn("Speaker_00: hello", paths["speaker_vtt"].read_text(encoding="utf-8"))
@@ -90,6 +99,34 @@ class DiarizationLogicTests(unittest.TestCase):
         self.assertEqual(first.safe_filename, "a_b.mp3")
         self.assertEqual(second.safe_filename, "a_b_1.mp3")
         self.assertEqual(second.collision_index, 1)
+
+    def test_safe_relative_path_normalizes_components_and_collisions(self) -> None:
+        existing: dict[Path, set[str]] = {}
+
+        first = safe_relative_path(Path("政治 影片/A?B.mp4"), existing)
+        second = safe_relative_path(Path("政治 影片/A B.mp4"), existing)
+
+        self.assertEqual(first.name, "a_b.mp4")
+        self.assertEqual(second.name, "A B.mp4")
+
+    def test_safe_output_policy_modes(self) -> None:
+        chinese = "拉菲茲的破局之戰 19-May-2026.mp4"
+
+        self.assertEqual(parse_safe_output_policy(None), "auto")
+        self.assertEqual(choose_output_filename(chinese, "auto"), chinese)
+        self.assertEqual(choose_output_filename("a<b>c?.mp4", "auto"), "a_b_c.mp4")
+        self.assertEqual(choose_output_filename("CON.mp4", "auto"), "con_file.mp4")
+        self.assertEqual(choose_output_filename(chinese, "true"), "19-may-2026.mp4")
+        self.assertEqual(choose_output_filename(chinese, "false"), chinese)
+
+    def test_true_policy_normalizes_and_resolves_collisions(self) -> None:
+        existing: dict[Path, set[str]] = {}
+
+        first = safe_relative_path(Path("folder/A?B.mp4"), existing, "true")
+        second = safe_relative_path(Path("folder/A B.mp4"), existing, "true")
+
+        self.assertEqual(first.as_posix(), "folder/a_b.mp4")
+        self.assertEqual(second.as_posix(), "folder/a_b_1.mp4")
 
     def test_raw_cache_reuses_segments_and_key_changes_with_model(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -165,14 +202,14 @@ class DiarizationLogicTests(unittest.TestCase):
             self.assertEqual(result, (0, 0, 1, 0))
             self.assertEqual(next(iter(manifest["jobs"].values()))["status"], "skipped_missing_audio")
 
-    def test_output_base_preserves_nested_relative_path(self) -> None:
+    def test_output_base_uses_safe_nested_relative_path(self) -> None:
         base = output_base_for_whisper_json(
-            Path("/tmp/output/run/course/week1/audio.json"),
+            Path("/tmp/output/run/course week/audio file.json"),
             Path("/tmp/output"),
             Path("/tmp/output_pyannote"),
         )
 
-        self.assertEqual(base.as_posix(), "/tmp/output_pyannote/run/course/week1/audio")
+        self.assertEqual(base.as_posix(), "/tmp/output_pyannote/run/course week/audio file")
 
     def test_progress_duration_formats_unknown_and_clock_time(self) -> None:
         self.assertEqual(format_duration(None), "unknown")
@@ -209,6 +246,47 @@ class DiarizationLogicTests(unittest.TestCase):
         backend = PyannoteDiarizationBackend.__new__(PyannoteDiarizationBackend)
 
         self.assertIs(backend.unwrap_diarization_output(DiarizeOutput()), DiarizeOutput.speaker_diarization)
+
+    def test_cuda_oom_detection_and_fallback_parser(self) -> None:
+        self.assertTrue(is_cuda_oom_error(RuntimeError("CUDA error: out of memory")))
+        self.assertTrue(is_cuda_oom_error(RuntimeError("GET was unable to find an engine to execute this computation")))
+        self.assertEqual(parse_oom_fallback(None), "cpu")
+        self.assertEqual(parse_oom_fallback("skip"), "skip")
+
+    def test_run_single_diarization_retries_cuda_oom_on_cpu(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            audio = root / "audio.mp3"
+            whisper_json = root / "audio.json"
+            output_base = root / "out" / "audio"
+            audio.write_bytes(b"audio")
+            whisper_json.write_text(json.dumps({"segments": [{"start": 0, "end": 1, "text": "hi"}]}), encoding="utf-8")
+            devices: list[str | None] = []
+
+            class FakeBackend:
+                def __init__(self, config, auth_token=None, device=None, tf32_mode=None, verbose=False):
+                    self.device = device
+                    devices.append(device)
+
+                def diarize(self, audio_path, progress_reporter=None):
+                    if self.device is None:
+                        raise RuntimeError("CUDA error: out of memory")
+                    return [SpeakerSegment(0.0, 1.0, "SPEAKER_00")]
+
+            with mock.patch("scripts.run_diarization.PyannoteDiarizationBackend", FakeBackend):
+                paths, cache_hit = run_single_diarization(
+                    audio,
+                    whisper_json,
+                    output_base,
+                    DiarizationConfig(),
+                    0.3,
+                    root / "cache",
+                    oom_fallback="cpu",
+                )
+
+            self.assertFalse(cache_hit)
+            self.assertEqual(devices, [None, "cpu"])
+            self.assertTrue(paths["speaker_json"].exists())
 
 
 if __name__ == "__main__":

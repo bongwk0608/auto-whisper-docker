@@ -8,15 +8,21 @@ from pathlib import Path
 from typing import Any
 
 from diarization.backend import DiarizationConfig, SpeakerSegment
-from diarization.filename_normalization import unique_normalized_filename
+from diarization.filename_normalization import parse_safe_output_policy, safe_relative_path, unique_normalized_filename
 
 
 SPEAKER_FORMATS = ["json", "txt", "srt", "tsv", "vtt"]
 
 
-def output_base_for_whisper_json(whisper_json: Path, transcripts_dir: Path, output_dir: Path) -> Path:
+def output_base_for_whisper_json(
+    whisper_json: Path,
+    transcripts_dir: Path,
+    output_dir: Path,
+    existing_safe_names: dict[Path, set[str]] | None = None,
+    filename_policy: str = "auto",
+) -> Path:
     relative = whisper_json.relative_to(transcripts_dir)
-    return output_dir / relative.with_suffix("")
+    return output_dir / safe_relative_path(relative, existing_safe_names, filename_policy).with_suffix("")
 
 
 def speaker_output_paths(base: Path) -> dict[str, Path]:
@@ -45,6 +51,7 @@ def export_speaker_outputs(
     config: DiarizationConfig,
     status: str = "completed",
     warnings: list[str] | None = None,
+    filename_policy: str = "auto",
 ) -> dict[str, Path]:
     paths = speaker_output_paths(output_base)
     for path in paths.values():
@@ -54,6 +61,7 @@ def export_speaker_outputs(
         "audio": unique_normalized_filename(source_audio.name).to_dict(),
         "whisper_json": unique_normalized_filename(whisper_json.name).to_dict(),
     }
+    filename_policy = parse_safe_output_policy(filename_policy)
     speaker_labels = sorted({segment.speaker_label for segment in speaker_segments})
     speaker_map = {label: "Unknown" for label in speaker_labels}
     if any(segment.get("assigned_speaker") == "UNKNOWN" for segment in merged_segments):
@@ -77,6 +85,7 @@ def export_speaker_outputs(
         "text": whisper_data.get("text", ""),
         "warnings": warnings or [],
         "filename_normalization": filename_metadata,
+        "filename_policy": filename_policy,
     }
     raw_payload = {
         "source_audio": str(source_audio),
@@ -84,6 +93,7 @@ def export_speaker_outputs(
         "diarization": payload["diarization"],
         "speaker_segments": payload["speaker_segments"],
         "filename_normalization": filename_metadata,
+        "filename_policy": filename_policy,
     }
 
     _atomic_write_text(paths["speaker_json"], json.dumps(payload, indent=2, ensure_ascii=False, sort_keys=True) + "\n")
@@ -186,4 +196,3 @@ def _atomic_write_text(path: Path, content: str) -> None:
         handle.write(content)
         temp_name = handle.name
     Path(temp_name).replace(path)
-

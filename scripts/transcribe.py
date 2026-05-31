@@ -17,6 +17,8 @@ import torch
 import whisper
 from whisper.utils import get_writer
 
+from diarization.filename_normalization import parse_safe_output_policy, safe_relative_path
+
 
 ALL_FORMATS = ["txt", "json", "tsv", "srt", "vtt"]
 DEFAULT_SUPPORTED_EXTENSIONS = (
@@ -39,6 +41,7 @@ class PendingFile(NamedTuple):
     output_media_path: Path
     state_key: str
     display_key: str
+    safe_display_key: str
     fingerprint: dict[str, Any]
 
 
@@ -453,6 +456,7 @@ def build_mapping_record(
     local_staging: bool,
     overall_output_enabled: bool,
     overall_output_dir: Path,
+    filename_policy: str,
 ) -> dict[str, Any]:
     created, modified = source_timestamps(pair.input_dir)
     return {
@@ -472,6 +476,7 @@ def build_mapping_record(
         "overall_output_enabled": overall_output_enabled,
         "overall_output_root": str(overall_output_dir) if overall_output_enabled else "",
         "overall_pair_output_dir": str(overall_output_dir / pair.id) if overall_output_enabled else "",
+        "filename_policy": filename_policy,
         "recursive_scan_enabled": True,
         "supported_file_count": files_found,
         "updated_at": datetime.now().isoformat(timespec="seconds"),
@@ -504,6 +509,7 @@ def write_mapping_manifests(output_roots: list[Path], mappings: list[dict[str, A
         "overall_output_enabled",
         "overall_output_root",
         "overall_pair_output_dir",
+        "filename_policy",
         "recursive_scan_enabled",
         "supported_file_count",
         "updated_at",
@@ -527,6 +533,7 @@ def prepare_pair(
     local_staging: bool,
     overall_output_enabled: bool,
     overall_output_dir: Path,
+    filename_policy: str = "auto",
 ) -> PreparedPair:
     files = scan_files(pair.input_dir, extensions)
     print(f"Found {len(files)} supported file(s) under {pair.input_dir}.", flush=True)
@@ -568,17 +575,21 @@ def prepare_pair(
         local_staging,
         overall_output_enabled,
         overall_output_dir,
+        filename_policy,
     )
 
     skipped = 0
     skipped_no_audio = 0
     pending: list[PendingFile] = []
+    existing_safe_names: dict[Path, set[str]] = {}
 
     for index, source_path in enumerate(files, start=1):
         relative = source_path.relative_to(pair.input_dir)
         relative_key = relative.as_posix()
+        safe_relative = safe_relative_path(relative, existing_safe_names, filename_policy)
+        safe_relative_key = safe_relative.as_posix()
         key = f"{pair.id}:{relative_key}"
-        project_media_path = run_output_dir / relative
+        project_media_path = run_output_dir / safe_relative
         fingerprint = file_fingerprint(source_path, fingerprint_mode)
 
         if is_complete(state["files"].get(key), fingerprint, formats):
@@ -590,7 +601,7 @@ def prepare_pair(
             print(f"{pair.id} [{index}/{len(files)}] Skipping no-audio file: {relative_key}", flush=True)
             continue
 
-        pending.append(PendingFile(pair, index, len(files), source_path, project_media_path, key, relative_key, fingerprint))
+        pending.append(PendingFile(pair, index, len(files), source_path, project_media_path, key, relative_key, safe_relative_key, fingerprint))
 
     if not pending:
         active_run_ids.pop(pair.id, None)
@@ -613,6 +624,7 @@ def main() -> int:
     local_staging_dir = Path(env("LOCAL_STAGING_DIR", "/tmp/auto-whisper-staging"))
     overall_output_enabled = parse_bool(env("OVERALL_OUTPUT_ENABLED", "true"), "OVERALL_OUTPUT_ENABLED")
     overall_output_dir = Path(env("OVERALL_OUTPUT_DIR", "/overall-output"))
+    filename_policy = parse_safe_output_policy(env("SAFE_OUTPUT_FILENAMES", "auto"))
     formats = parse_formats("all")
     extensions = parse_list(env("SUPPORTED_EXTENSIONS", DEFAULT_SUPPORTED_EXTENSIONS))
     pairs = parse_input_output_pairs()
@@ -633,6 +645,7 @@ def main() -> int:
         "local_staging_dir": str(local_staging_dir) if local_staging else "",
         "overall_output_enabled": overall_output_enabled,
         "overall_output_dir": str(overall_output_dir) if overall_output_enabled else "",
+        "filename_policy": filename_policy,
     }
 
     skipped = 0
@@ -653,6 +666,7 @@ def main() -> int:
             local_staging,
             overall_output_enabled,
             overall_output_dir,
+            filename_policy,
         )
         skipped += prepared.skipped
         skipped_no_audio += prepared.skipped_no_audio
@@ -690,7 +704,7 @@ def main() -> int:
             overall_outputs = copy_overall_outputs(
                 project_outputs,
                 item.source_path,
-                item.display_key,
+                item.safe_display_key,
                 item.pair.id,
                 overall_output_enabled,
                 overall_output_dir,
@@ -704,12 +718,17 @@ def main() -> int:
                 "input_dir": str(item.pair.input_dir),
                 "output_dir": str(item.pair.output_dir),
                 "relative_path": item.display_key,
+                "original_relative_path": item.display_key,
+                "safe_relative_path": item.safe_display_key,
+                "filename_policy": filename_policy,
                 "fingerprint": item.fingerprint,
                 "fingerprint_mode": fingerprint_mode,
                 "local_staging": local_staging,
                 "formats": formats,
                 "project_outputs": [str(path) for path in project_outputs],
                 "overall_outputs": [str(path) for path in overall_outputs],
+                "original_output_paths": [],
+                "safe_output_paths": [str(path) for path in project_outputs + overall_outputs],
                 "completed_at": datetime.now().isoformat(timespec="seconds"),
             }
             completed += 1

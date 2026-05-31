@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import gc
 from pathlib import Path
 from typing import Any
 
@@ -12,11 +13,43 @@ class PyannoteModelAccessError(RuntimeError):
     pass
 
 
+class DiarizationOutOfMemoryError(RuntimeError):
+    pass
+
+
 def parse_tf32_mode(value: str | None) -> str:
     mode = (value or "false").strip().lower()
     if mode not in {"auto", "true", "false"}:
         raise ValueError("DIARIZATION_TF32 must be one of: auto, true, false")
     return mode
+
+
+def parse_oom_fallback(value: str | None) -> str:
+    mode = (value or "cpu").strip().lower()
+    if mode not in {"cpu", "skip", "fail"}:
+        raise ValueError("DIARIZATION_OOM_FALLBACK must be one of: cpu, skip, fail")
+    return mode
+
+
+def is_cuda_oom_error(error: BaseException) -> bool:
+    message = str(error).lower()
+    return "out of memory" in message or "unable to find an engine" in message
+
+
+def cleanup_cuda_memory(verbose: bool = False) -> None:
+    gc.collect()
+    try:
+        import torch
+    except ImportError:
+        return
+    if not torch.cuda.is_available():
+        return
+    torch.cuda.empty_cache()
+    ipc_collect = getattr(torch.cuda, "ipc_collect", None)
+    if callable(ipc_collect):
+        ipc_collect()
+    if verbose:
+        print("CUDA cleanup completed", flush=True)
 
 
 class PyannoteDiarizationBackend:
@@ -115,7 +148,9 @@ class PyannoteDiarizationBackend:
             raise
 
     def validate_access(self) -> None:
-        self.load_pipeline()
+        pipeline, _torch = self.load_pipeline()
+        del pipeline
+        cleanup_cuda_memory(verbose=self.verbose)
 
     def configure_tf32(self, torch: Any, stage: str) -> None:
         if not torch.cuda.is_available():

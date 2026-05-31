@@ -471,6 +471,8 @@ DIARIZATION_MODEL=pyannote/speaker-diarization-community-1
 DIARIZATION_VERBOSE=false
 DIARIZATION_PROGRESS=
 DIARIZATION_TF32=false
+DIARIZATION_OOM_FALLBACK=cpu
+SAFE_OUTPUT_FILENAMES=auto
 PYANNOTE_METRICS_ENABLED=0
 ```
 
@@ -489,6 +491,20 @@ Pyannote's TF32 reproducibility warning is not a crash. If you enable TF32 inten
 - `false` disables live progress lines.
 
 Pyannote does not diarize Whisper transcript lines one by one. During inference, progress is file-level and pyannote-stage-level, such as segmentation, embedding, and clustering. After inference finishes, the project logs the merge back into Whisper segments.
+
+`DIARIZATION_OOM_FALLBACK` controls what happens when CUDA runs out of memory during diarization:
+
+- `cpu` is the default and retries the same file once on CPU after CUDA cleanup. This is slower, but gives the best chance of finishing the full batch.
+- `skip` records the file as failed and continues to the next file.
+- `fail` stops the run immediately.
+
+`SAFE_OUTPUT_FILENAMES` controls generated output names:
+
+- `auto` is the default and keeps readable Unicode names unless a filename is risky for Windows/Docker/path handling.
+- `true` always normalizes generated output paths to ASCII-safe names.
+- `false` keeps original generated output names, except path traversal and separators are still sanitized.
+
+Original source filenames are not renamed; they are preserved in state and JSON metadata so legacy outputs remain traceable.
 
 Build and run the separate CUDA diarization service manually:
 
@@ -603,6 +619,8 @@ Important `.env` values:
 - `DIARIZATION_VERBOSE`: `true` for project-level pyannote progress/timing logs, or `false`
 - `DIARIZATION_PROGRESS`: empty to follow `DIARIZATION_VERBOSE`, `true` for live pyannote stage progress with percentage/ETA when available, or `false`
 - `DIARIZATION_TF32`: `false` for reproducible pyannote CUDA output, `true` for faster TF32 inference, or `auto` to leave PyTorch defaults unchanged
+- `DIARIZATION_OOM_FALLBACK`: `cpu` to retry CUDA OOM files on CPU, `skip` to continue without retry, or `fail` to stop immediately
+- `SAFE_OUTPUT_FILENAMES`: `auto` to keep readable names when safe, `true` to always normalize, or `false` to keep original generated names
 - `FINGERPRINT_MODE`: `metadata` for fast network-drive skip checks, or `sha256` for full-file hashing
 - `LOCAL_STAGING`: `true` to copy only pending files to local temporary storage before transcription
 - `LOCAL_STAGING_DIR`: staging directory used when `LOCAL_STAGING=true`

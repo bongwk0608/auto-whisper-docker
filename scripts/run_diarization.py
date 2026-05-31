@@ -14,9 +14,17 @@ if str(ROOT) not in sys.path:
 
 from diarization.backend import DiarizationConfig, SpeakerSegment
 from diarization.export_speaker_transcript import export_speaker_outputs, speaker_outputs_complete
+from diarization.filename_normalization import parse_safe_output_policy
 from diarization.merge_whisper_speakers import MergeConfig, assign_speakers_to_whisper_segments
 from diarization.progress import DiarizationProgressReporter, ProgressContext, parse_progress_enabled
-from diarization.pyannote_runner import PyannoteDiarizationBackend, parse_tf32_mode
+from diarization.pyannote_runner import (
+    DiarizationOutOfMemoryError,
+    PyannoteDiarizationBackend,
+    cleanup_cuda_memory,
+    is_cuda_oom_error,
+    parse_oom_fallback,
+    parse_tf32_mode,
+)
 from diarization.raw_cache import cache_key, load_cached_segments, save_cached_segments
 
 
@@ -53,6 +61,8 @@ def run_single_diarization(
     tf32_mode: str | None = None,
     progress: bool = False,
     progress_context: ProgressContext | None = None,
+    oom_fallback: str = "cpu",
+    filename_policy: str = "auto",
 ) -> tuple[dict[str, Path], bool]:
     started_at = time.perf_counter()
     if speaker_outputs_complete(output_base) and not force:
@@ -73,12 +83,30 @@ def run_single_diarization(
         speaker_segments = cached
     else:
         print(f"Raw diarization cache miss: {audio_path}", flush=True)
-        backend = PyannoteDiarizationBackend(config, tf32_mode=tf32_mode, verbose=verbose)
         if verbose:
             print(f"Starting Pyannote inference: model={config.model} audio={audio_path}", flush=True)
         inference_started_at = time.perf_counter()
         progress_reporter = DiarizationProgressReporter(progress_context) if progress else None
-        speaker_segments = backend.diarize(audio_path, progress_reporter=progress_reporter)
+        try:
+            backend = PyannoteDiarizationBackend(config, tf32_mode=tf32_mode, verbose=verbose)
+            try:
+                speaker_segments = backend.diarize(audio_path, progress_reporter=progress_reporter)
+            finally:
+                del backend
+                cleanup_cuda_memory(verbose=verbose)
+        except Exception as exc:
+            cleanup_cuda_memory(verbose=verbose)
+            if not is_cuda_oom_error(exc):
+                raise
+            if oom_fallback != "cpu":
+                raise DiarizationOutOfMemoryError(str(exc)) from exc
+            print(f"CUDA OOM detected; retrying on CPU: {audio_path}", flush=True)
+            cpu_backend = PyannoteDiarizationBackend(config, device="cpu", tf32_mode=tf32_mode, verbose=verbose)
+            try:
+                speaker_segments = cpu_backend.diarize(audio_path, progress_reporter=progress_reporter)
+            finally:
+                del cpu_backend
+                cleanup_cuda_memory(verbose=verbose)
         if verbose:
             elapsed = time.perf_counter() - inference_started_at
             print(f"Finished Pyannote inference: speakers={len({segment.speaker_label for segment in speaker_segments})} segments={len(speaker_segments)} elapsed={elapsed:.1f}s", flush=True)
@@ -97,7 +125,16 @@ def run_single_diarization(
         speaker_segments,
         MergeConfig(min_overlap_ratio=min_overlap_ratio),
     )
-    paths = export_speaker_outputs(output_base, audio_path, whisper_json, whisper_data, speaker_segments, merged_segments, config)
+    paths = export_speaker_outputs(
+        output_base,
+        audio_path,
+        whisper_json,
+        whisper_data,
+        speaker_segments,
+        merged_segments,
+        config,
+        filename_policy=filename_policy,
+    )
     if verbose:
         elapsed = time.perf_counter() - started_at
         print(f"Exported diarization outputs: files={len(paths)} output_base={output_base} elapsed={elapsed:.1f}s", flush=True)
@@ -116,7 +153,9 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--min-speakers", type=int, default=parse_optional_int(os.environ.get("DIARIZATION_MIN_SPEAKERS")))
     parser.add_argument("--max-speakers", type=int, default=parse_optional_int(os.environ.get("DIARIZATION_MAX_SPEAKERS")))
     parser.add_argument("--cache-dir", type=Path, default=Path(os.environ.get("DIARIZATION_CACHE_DIR", "state/diarization-cache")))
+    parser.add_argument("--safe-output-filenames", choices=["auto", "true", "false"], default=parse_safe_output_policy(os.environ.get("SAFE_OUTPUT_FILENAMES")))
     parser.add_argument("--tf32", choices=["auto", "true", "false"], default=parse_tf32_mode(os.environ.get("DIARIZATION_TF32")))
+    parser.add_argument("--oom-fallback", choices=["cpu", "skip", "fail"], default=parse_oom_fallback(os.environ.get("DIARIZATION_OOM_FALLBACK")))
     parser.add_argument("--verbose", action="store_true", default=parse_bool(os.environ.get("DIARIZATION_VERBOSE"), False))
     progress_default = parse_progress_enabled(os.environ.get("DIARIZATION_PROGRESS"), parse_bool(os.environ.get("DIARIZATION_VERBOSE"), False))
     parser.add_argument("--progress", dest="progress", action="store_true", default=progress_default)
@@ -151,6 +190,8 @@ def main() -> int:
         args.tf32,
         args.progress and not args.dry_run,
         ProgressContext(file_index=1, file_total=1),
+        args.oom_fallback,
+        args.safe_output_filenames,
     )
     for name, path in paths.items():
         print(f"{name}: {path}", flush=True)

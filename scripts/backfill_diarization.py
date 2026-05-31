@@ -14,9 +14,16 @@ if str(ROOT) not in sys.path:
 
 from diarization.backend import DiarizationConfig
 from diarization.export_speaker_transcript import output_base_for_whisper_json, speaker_outputs_complete
+from diarization.filename_normalization import parse_safe_output_policy
 from diarization.manifest import load_manifest, manifest_key, save_manifest, update_job
 from diarization.progress import ProgressContext, parse_progress_enabled
-from diarization.pyannote_runner import PyannoteModelAccessError, PyannoteDiarizationBackend, parse_tf32_mode
+from diarization.pyannote_runner import (
+    DiarizationOutOfMemoryError,
+    PyannoteModelAccessError,
+    PyannoteDiarizationBackend,
+    parse_oom_fallback,
+    parse_tf32_mode,
+)
 from scripts.run_diarization import parse_bool, parse_optional_int, run_single_diarization
 
 
@@ -142,38 +149,54 @@ def process_transcript_set(
     verbose: bool = False,
     tf32_mode: str = "false",
     progress: bool = False,
+    oom_fallback: str = "cpu",
+    filename_policy: str = "auto",
 ) -> tuple[int, int, int, int]:
     completed = 0
     skipped = 0
     missing_audio = 0
     failed = 0
-    entries: list[tuple[Path, Path, str, Path | None]] = []
+    entries: list[tuple[Path, Path, Path, str, Path | None]] = []
+    existing_safe_names: dict[Path, set[str]] = {}
 
     for whisper_json in iter_whisper_json_files(transcripts_dir):
-        output_base = output_base_for_whisper_json(whisper_json, transcripts_dir, output_dir)
+        output_base = output_base_for_whisper_json(
+            whisper_json,
+            transcripts_dir,
+            output_dir,
+            existing_safe_names,
+            filename_policy,
+        )
+        legacy_output_base = output_dir / whisper_json.relative_to(transcripts_dir).with_suffix("")
         key = manifest_key(whisper_json, output_base)
         audio_path = audio_lookup.get(str(whisper_json.resolve()))
         if audio_path is None:
             audio_path = discover_audio_from_audio_dir(whisper_json, transcripts_dir, audio_dir)
-        entries.append((whisper_json, output_base, key, audio_path))
+        entries.append((whisper_json, output_base, legacy_output_base, key, audio_path))
 
     processable_total = sum(
         1
-        for _whisper_json, output_base, _key, audio_path in entries
-        if (force or not speaker_outputs_complete(output_base)) and audio_path is not None and audio_path.exists()
+        for _whisper_json, output_base, legacy_output_base, _key, audio_path in entries
+        if (
+            force
+            or not (speaker_outputs_complete(output_base) or speaker_outputs_complete(legacy_output_base))
+        )
+        and audio_path is not None
+        and audio_path.exists()
     )
     processable_index = 0
 
-    for whisper_json, output_base, key, audio_path in entries:
+    for whisper_json, output_base, legacy_output_base, key, audio_path in entries:
         print(f"Processing Whisper JSON: {whisper_json}", flush=True)
         if verbose:
             print(f"Resolved output base: {output_base}", flush=True)
             print(f"Resolved audio path: {audio_path or '<missing>'}", flush=True)
-        if speaker_outputs_complete(output_base) and not force:
+        complete_output_base = output_base if speaker_outputs_complete(output_base) else legacy_output_base
+        if (speaker_outputs_complete(output_base) or speaker_outputs_complete(legacy_output_base)) and not force:
             skipped += 1
-            update_job(manifest, key, "skipped_existing", whisper_json, output_base, audio_path)
+            update_job(manifest, key, "skipped_existing", whisper_json, complete_output_base, audio_path)
             save_manifest(manifest_path, manifest)
-            print(f"Skipped existing: {output_base}", flush=True)
+            print(f"Skipped existing: {complete_output_base}", flush=True)
             continue
 
         if audio_path is None or not audio_path.exists():
@@ -203,11 +226,15 @@ def process_transcript_set(
                 tf32_mode=tf32_mode,
                 progress=progress,
                 progress_context=ProgressContext(file_index=processable_index, file_total=processable_total),
+                oom_fallback=oom_fallback,
+                filename_policy=filename_policy,
             )
             completed += 1
             update_job(manifest, key, "completed", whisper_json, output_base, audio_path, output_paths, cache_hit=cache_hit)
             print(f"Completed: {output_base}", flush=True)
         except Exception as exc:
+            if isinstance(exc, DiarizationOutOfMemoryError) and oom_fallback == "fail":
+                raise
             failed += 1
             update_job(manifest, key, "failed", whisper_json, output_base, audio_path, error_message=str(exc))
             print(f"Failed: {whisper_json}: {exc}", file=sys.stderr, flush=True)
@@ -228,6 +255,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--state-path", type=Path, default=Path("state/progress.json"))
     parser.add_argument("--manifest-path", type=Path, default=Path("state/diarization-progress.json"))
     parser.add_argument("--cache-dir", type=Path, default=Path(os.environ.get("DIARIZATION_CACHE_DIR", "state/diarization-cache")))
+    parser.add_argument("--safe-output-filenames", choices=["auto", "true", "false"], default=parse_safe_output_policy(os.environ.get("SAFE_OUTPUT_FILENAMES")))
     parser.add_argument("--backend", default=os.environ.get("DIARIZATION_BACKEND", "pyannote"))
     parser.add_argument("--model", default=os.environ.get("DIARIZATION_MODEL", "pyannote/speaker-diarization-community-1"))
     parser.add_argument("--min-overlap-ratio", type=float, default=float(os.environ.get("DIARIZATION_MIN_OVERLAP_RATIO", "0.3")))
@@ -235,6 +263,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--min-speakers", type=int, default=parse_optional_int(os.environ.get("DIARIZATION_MIN_SPEAKERS")))
     parser.add_argument("--max-speakers", type=int, default=parse_optional_int(os.environ.get("DIARIZATION_MAX_SPEAKERS")))
     parser.add_argument("--tf32", choices=["auto", "true", "false"], default=parse_tf32_mode(os.environ.get("DIARIZATION_TF32")))
+    parser.add_argument("--oom-fallback", choices=["cpu", "skip", "fail"], default=parse_oom_fallback(os.environ.get("DIARIZATION_OOM_FALLBACK")))
     parser.add_argument("--verbose", action="store_true", default=parse_bool(os.environ.get("DIARIZATION_VERBOSE"), False))
     progress_default = parse_progress_enabled(os.environ.get("DIARIZATION_PROGRESS"), parse_bool(os.environ.get("DIARIZATION_VERBOSE"), False))
     parser.add_argument("--progress", dest="progress", action="store_true", default=progress_default)
@@ -254,7 +283,8 @@ def main() -> int:
     config = DiarizationConfig(args.backend, args.model, args.num_speakers, args.min_speakers, args.max_speakers)
     print(
         f"Diarization startup: model={config.model} verbose={args.verbose} "
-        f"progress={args.progress and not args.dry_run} tf32={args.tf32} dry_run={args.dry_run}",
+        f"progress={args.progress and not args.dry_run} tf32={args.tf32} "
+        f"oom_fallback={args.oom_fallback} filename_policy={args.safe_output_filenames} dry_run={args.dry_run}",
         flush=True,
     )
     if not args.dry_run:
@@ -287,6 +317,8 @@ def main() -> int:
             args.verbose,
             args.tf32,
             args.progress and not args.dry_run,
+            args.oom_fallback,
+            args.safe_output_filenames,
         )
         totals[0] += completed
         totals[1] += skipped
