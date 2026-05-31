@@ -44,6 +44,67 @@ services:
     stdin_open: true
     tty: true
 
+  diarization-cuda:
+    profiles: ["diarization"]
+    build:
+      context: .
+      dockerfile: Dockerfile.diarization
+    image: auto-whisper:diarization-cuda
+    gpus: all
+    volumes:
+      - type: bind
+        source: .
+        target: /app
+      - type: bind
+        source: ./output
+        target: /app/output
+      - type: bind
+        source: ./output_overall
+        target: /app/output_overall
+      - type: bind
+        source: ./output_pyannote
+        target: /app/output_pyannote
+      - type: bind
+        source: ./output_pyannote_overall
+        target: /app/output_pyannote_overall
+      - type: bind
+        source: ./state
+        target: /app/state
+      - type: bind
+        source: ./.cache/huggingface
+        target: /cache/huggingface
+      - type: bind
+        source: ./.cache/torch
+        target: /cache/torch
+    environment:
+      PYANNOTE_AUTH_TOKEN: ${PYANNOTE_AUTH_TOKEN:-}
+      PYANNOTE_METRICS_ENABLED: ${PYANNOTE_METRICS_ENABLED:-0}
+      DIARIZATION_BACKEND: ${DIARIZATION_BACKEND:-pyannote}
+      DIARIZATION_MODEL: ${DIARIZATION_MODEL:-pyannote/speaker-diarization-community-1}
+      DIARIZATION_MIN_OVERLAP_RATIO: ${DIARIZATION_MIN_OVERLAP_RATIO:-0.3}
+      DIARIZATION_NUM_SPEAKERS: ${DIARIZATION_NUM_SPEAKERS:-}
+      DIARIZATION_MIN_SPEAKERS: ${DIARIZATION_MIN_SPEAKERS:-}
+      DIARIZATION_MAX_SPEAKERS: ${DIARIZATION_MAX_SPEAKERS:-}
+      DIARIZATION_CACHE_DIR: ${DIARIZATION_CACHE_DIR:-/app/state/diarization-cache}
+      HF_HOME: ${HF_HOME:-/cache/huggingface}
+      TORCH_HOME: ${TORCH_HOME:-/cache/torch}
+      NVIDIA_VISIBLE_DEVICES: ${NVIDIA_VISIBLE_DEVICES:-all}
+      NVIDIA_DRIVER_CAPABILITIES: ${NVIDIA_DRIVER_CAPABILITIES:-compute,utility}
+    working_dir: /app
+    command: >
+      python scripts/backfill_diarization.py
+      --transcripts-dir ./output
+      --output-dir ./output_pyannote
+      --overall-transcripts-dir ./output_overall
+      --overall-output-dir ./output_pyannote_overall
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+
   whisper-cuda:
     profiles: ["cuda"]
     build:

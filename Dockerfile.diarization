@@ -1,0 +1,19 @@
+FROM python:3.11-slim
+
+ENV PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1 \
+    PIP_NO_CACHE_DIR=1 \
+    PYANNOTE_METRICS_ENABLED=0
+
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends ffmpeg git \
+    && rm -rf /var/lib/apt/lists/*
+
+RUN python -m pip install --upgrade pip \
+    && python -m pip install torch torchaudio --index-url https://download.pytorch.org/whl/cu124 \
+    && python -m pip install pyannote.audio
+
+WORKDIR /app
+
+CMD ["python", "scripts/backfill_diarization.py"]
+

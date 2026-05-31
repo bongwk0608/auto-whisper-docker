@@ -431,6 +431,96 @@ output/input-output-mapping.csv
 
 The mapping includes each pair id, host input path when available, container input path, host output root when available, container output root, timestamped run output folder, overall output folder, input folder created/modified timestamps, output formats, recursive scan status, and the number of supported files found under that input folder.
 
+## Optional Speaker Diarization
+
+Speaker diarization is implemented as a separate optional post-processing service. The Whisper service owns transcription, and the diarization service owns speaker labeling. They communicate only through files, not shared runtime state.
+
+```text
+Existing Whisper service:
+Audio -> Whisper transcription -> output/ -> output_overall/
+
+New diarization service:
+Whisper JSON + original audio -> pyannote diarization -> speaker merge/export -> output_pyannote/ -> output_pyannote_overall/
+```
+
+Whisper outputs in `output/` and `output_overall/` are immutable raw transcript artifacts. Diarization never edits those files. It reads Whisper `.json` files as the transcript source of truth and writes derived speaker artifacts only under:
+
+```text
+output_pyannote/
+output_pyannote_overall/
+state/diarization-progress.json
+state/diarization-cache/
+```
+
+For each Whisper JSON transcript, diarization can generate:
+
+```text
+example.speaker.json
+example.speaker.txt
+example.speaker.srt
+example.speaker.tsv
+example.speaker.vtt
+example.diarization.json
+```
+
+Set a Hugging Face token that can access the pyannote model:
+
+```env
+PYANNOTE_AUTH_TOKEN=hf_...
+DIARIZATION_MODEL=pyannote/speaker-diarization-community-1
+PYANNOTE_METRICS_ENABLED=0
+```
+
+Build and run the separate CUDA diarization service manually:
+
+```sh
+docker compose --profile diarization build diarization-cuda
+docker compose --profile diarization run --rm diarization-cuda
+```
+
+The service runs `scripts/backfill_diarization.py` by default:
+
+```sh
+python scripts/backfill_diarization.py \
+  --transcripts-dir ./output \
+  --output-dir ./output_pyannote \
+  --overall-transcripts-dir ./output_overall \
+  --overall-output-dir ./output_pyannote_overall
+```
+
+Useful options:
+
+```sh
+python scripts/backfill_diarization.py --dry-run
+python scripts/backfill_diarization.py --force
+python scripts/backfill_diarization.py --min-overlap-ratio 0.3 --min-speakers 1 --max-speakers 5
+```
+
+For a single transcript:
+
+```sh
+python scripts/run_diarization.py \
+  --audio path/to/audio.mp3 \
+  --whisper-json path/to/example.json \
+  --output-dir ./output_pyannote
+```
+
+Raw pyannote output is cached per source audio, file size, modified time, backend, model, and speaker-count parameters. If `output/` and `output_overall/` reference the same audio, the second pass reuses the cached speaker timeline and reruns only merge/export.
+
+For RTX 3050Ti 4GB and similar small-GPU systems, run Whisper and pyannote sequentially:
+
+```sh
+docker compose run --rm whisper-cuda
+docker compose --profile diarization run --rm diarization-cuda
+```
+
+Do not keep Whisper and pyannote running on the GPU at the same time. To check WSL and Docker GPU visibility:
+
+```sh
+nvidia-smi
+docker run --rm --gpus all nvidia/cuda:12.4.1-base-ubuntu22.04 nvidia-smi
+```
+
 When multiple input folders share the same output root, each input still gets its own timestamped subfolder. For example:
 
 ```text

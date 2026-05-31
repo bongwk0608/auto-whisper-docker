@@ -3,11 +3,16 @@ input-folders.txt
 docker-compose.override.yml
 output/
 output_overall/
+output_pyannote/
+output_pyannote_overall/
 state/
 test_input/
 models/*
 !models/.gitkeep
 .cache/
+.cache/huggingface/
+.cache/torch/
+state/diarization-cache/
 __pycache__/
 *.pyc
 *.log
