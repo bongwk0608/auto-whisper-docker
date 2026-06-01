@@ -10,7 +10,7 @@ from pathlib import Path
 from diarization.backend import DiarizationConfig, SpeakerSegment
 
 
-def cache_key(audio_path: Path, config: DiarizationConfig) -> str:
+def cache_key(audio_path: Path, config: DiarizationConfig, audio_preprocess: str | None = None) -> str:
     stat = audio_path.stat()
     payload = {
         "audio_absolute_path": str(audio_path.resolve()),
@@ -22,6 +22,8 @@ def cache_key(audio_path: Path, config: DiarizationConfig) -> str:
         "min_speakers": config.min_speakers,
         "max_speakers": config.max_speakers,
     }
+    if audio_preprocess is not None:
+        payload["audio_preprocess"] = audio_preprocess
     encoded = json.dumps(payload, sort_keys=True).encode("utf-8")
     return hashlib.sha256(encoded).hexdigest()
 
@@ -58,4 +60,3 @@ def save_cached_segments(cache_dir: Path, key: str, audio_path: Path, config: Di
         temp_name = handle.name
     Path(temp_name).replace(path)
     return path
-

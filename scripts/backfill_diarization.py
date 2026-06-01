@@ -13,6 +13,7 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from diarization.backend import DiarizationConfig
+from diarization.audio_preprocess import parse_audio_preprocess_mode
 from diarization.export_speaker_transcript import output_base_for_whisper_json, speaker_outputs_complete
 from diarization.filename_normalization import parse_safe_output_policy
 from diarization.manifest import load_manifest, manifest_key, save_manifest, update_job
@@ -233,6 +234,8 @@ def process_transcript_set(
     progress: bool = False,
     oom_fallback: str = "cpu",
     filename_policy: str = "auto",
+    audio_preprocess: str = "auto",
+    audio_preprocess_dir: Path = Path("/tmp/auto-whisper-diarization"),
 ) -> tuple[int, int, int, int]:
     completed = 0
     skipped = 0
@@ -310,6 +313,8 @@ def process_transcript_set(
                 progress_context=ProgressContext(file_index=processable_index, file_total=processable_total),
                 oom_fallback=oom_fallback,
                 filename_policy=filename_policy,
+                audio_preprocess=audio_preprocess,
+                audio_preprocess_dir=audio_preprocess_dir,
             )
             completed += 1
             update_job(manifest, key, "completed", whisper_json, output_base, audio_path, output_paths, cache_hit=cache_hit)
@@ -341,6 +346,8 @@ def process_state_output_jobs(
     progress: bool = False,
     oom_fallback: str = "cpu",
     filename_policy: str = "auto",
+    audio_preprocess: str = "auto",
+    audio_preprocess_dir: Path = Path("/tmp/auto-whisper-diarization"),
 ) -> tuple[int, int, int, int]:
     completed = 0
     skipped = 0
@@ -414,6 +421,8 @@ def process_state_output_jobs(
                 progress=progress,
                 progress_context=ProgressContext(file_index=processable_index, file_total=processable_total),
                 oom_fallback=oom_fallback,
+                audio_preprocess=audio_preprocess,
+                audio_preprocess_dir=audio_preprocess_dir,
             )
             combined_output_paths: dict[str, Path] = {}
             for target_index, target in enumerate(pending_targets, start=1):
@@ -466,6 +475,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--manifest-path", type=Path, default=Path("state/diarization-progress.json"))
     parser.add_argument("--cache-dir", type=Path, default=Path(os.environ.get("DIARIZATION_CACHE_DIR", "state/diarization-cache")))
     parser.add_argument("--safe-output-filenames", choices=["auto", "true", "false"], default=parse_safe_output_policy(os.environ.get("SAFE_OUTPUT_FILENAMES")))
+    parser.add_argument("--audio-preprocess", choices=["auto", "always", "false"], default=parse_audio_preprocess_mode(os.environ.get("DIARIZATION_AUDIO_PREPROCESS")))
+    parser.add_argument("--audio-preprocess-dir", type=Path, default=Path(os.environ.get("DIARIZATION_AUDIO_PREPROCESS_DIR", "/tmp/auto-whisper-diarization")))
     parser.add_argument("--backend", default=os.environ.get("DIARIZATION_BACKEND", "pyannote"))
     parser.add_argument("--model", default=os.environ.get("DIARIZATION_MODEL", "pyannote/speaker-diarization-community-1"))
     parser.add_argument("--min-overlap-ratio", type=float, default=float(os.environ.get("DIARIZATION_MIN_OVERLAP_RATIO", "0.3")))
@@ -495,7 +506,8 @@ def main() -> int:
         print(
             f"Diarization startup: model={config.model} verbose={args.verbose} "
             f"progress={args.progress and not args.dry_run} tf32={args.tf32} "
-            f"oom_fallback={args.oom_fallback} filename_policy={args.safe_output_filenames} dry_run={args.dry_run}",
+            f"oom_fallback={args.oom_fallback} filename_policy={args.safe_output_filenames} "
+            f"audio_preprocess={args.audio_preprocess} dry_run={args.dry_run}",
             flush=True,
         )
         if not args.dry_run:
@@ -530,6 +542,8 @@ def main() -> int:
                 args.progress and not args.dry_run,
                 args.oom_fallback,
                 args.safe_output_filenames,
+                args.audio_preprocess,
+                args.audio_preprocess_dir,
             )
             totals = [completed, skipped, missing_audio, failed]
         else:
@@ -555,6 +569,8 @@ def main() -> int:
                     args.progress and not args.dry_run,
                     args.oom_fallback,
                     args.safe_output_filenames,
+                    args.audio_preprocess,
+                    args.audio_preprocess_dir,
                 )
                 totals[0] += completed
                 totals[1] += skipped

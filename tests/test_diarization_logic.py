@@ -7,6 +7,12 @@ from pathlib import Path
 from unittest import mock
 
 from diarization.backend import DiarizationConfig, SpeakerSegment
+from diarization.audio_preprocess import (
+    audio_preprocess_cache_tag,
+    parse_audio_preprocess_mode,
+    prepared_pyannote_audio,
+    should_preprocess_audio,
+)
 from diarization.export_speaker_transcript import export_speaker_outputs, output_base_for_whisper_json, speaker_outputs_complete
 from diarization.filename_normalization import (
     choose_output_filename,
@@ -138,12 +144,44 @@ class DiarizationLogicTests(unittest.TestCase):
 
             key = cache_key(audio, config)
             other_key = cache_key(audio, other_config)
+            preprocessed_key = cache_key(audio, config, audio_preprocess="pcm16k-mono-v1:auto")
             save_cached_segments(root / "cache", key, audio, config, [SpeakerSegment(0.0, 1.0, "Speaker_00")])
 
             cached = load_cached_segments(root / "cache", key)
 
             self.assertNotEqual(key, other_key)
+            self.assertNotEqual(key, preprocessed_key)
             self.assertEqual(cached, [SpeakerSegment(0.0, 1.0, "Speaker_00")])
+
+    def test_audio_preprocess_policy_modes(self) -> None:
+        self.assertEqual(parse_audio_preprocess_mode(None), "auto")
+        self.assertTrue(should_preprocess_audio(Path("audio.m4a"), "auto"))
+        self.assertTrue(should_preprocess_audio(Path("video.mp4"), "auto"))
+        self.assertFalse(should_preprocess_audio(Path("audio.wav"), "auto"))
+        self.assertTrue(should_preprocess_audio(Path("audio.wav"), "always"))
+        self.assertFalse(should_preprocess_audio(Path("audio.m4a"), "false"))
+        self.assertEqual(audio_preprocess_cache_tag("auto", Path("audio.m4a")), "pcm16k-mono-v1:auto")
+        self.assertEqual(audio_preprocess_cache_tag("auto", Path("audio.wav")), "direct:auto")
+
+    def test_prepared_pyannote_audio_converts_and_cleans_temp_wav(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            audio = root / "audio.m4a"
+            audio.write_bytes(b"audio")
+            seen_target: list[Path] = []
+
+            def fake_run(command, capture_output, text, check):
+                target = Path(command[-1])
+                target.write_bytes(b"wav")
+                return mock.Mock(returncode=0, stderr="", stdout="")
+
+            with mock.patch("diarization.audio_preprocess.subprocess.run", side_effect=fake_run):
+                with prepared_pyannote_audio(audio, "auto", root / "staging") as prepared:
+                    seen_target.append(prepared)
+                    self.assertEqual(prepared.suffix, ".wav")
+                    self.assertTrue(prepared.exists())
+
+            self.assertFalse(seen_target[0].exists())
 
     def test_backfill_dry_run_records_pending_without_writes(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -295,6 +333,49 @@ class DiarizationLogicTests(unittest.TestCase):
             self.assertFalse(cache_hit)
             self.assertEqual(devices, [None, "cpu"])
             self.assertTrue(paths["speaker_json"].exists())
+
+    def test_run_single_diarization_uses_preprocessed_audio_but_exports_original(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            audio = root / "audio.m4a"
+            whisper_json = root / "audio.json"
+            output_base = root / "out" / "audio"
+            audio.write_bytes(b"audio")
+            whisper_json.write_text(json.dumps({"segments": [{"start": 0, "end": 1, "text": "hi"}]}), encoding="utf-8")
+            backend_audio_paths: list[Path] = []
+
+            def fake_run(command, capture_output, text, check):
+                Path(command[-1]).write_bytes(b"wav")
+                return mock.Mock(returncode=0, stderr="", stdout="")
+
+            class FakeBackend:
+                def __init__(self, config, auth_token=None, device=None, tf32_mode=None, verbose=False):
+                    pass
+
+                def diarize(self, audio_path, progress_reporter=None):
+                    backend_audio_paths.append(Path(audio_path))
+                    return [SpeakerSegment(0.0, 1.0, "SPEAKER_00")]
+
+            with (
+                mock.patch("scripts.run_diarization.PyannoteDiarizationBackend", FakeBackend),
+                mock.patch("diarization.audio_preprocess.subprocess.run", side_effect=fake_run),
+            ):
+                paths, cache_hit = run_single_diarization(
+                    audio,
+                    whisper_json,
+                    output_base,
+                    DiarizationConfig(),
+                    0.3,
+                    root / "cache",
+                    audio_preprocess="auto",
+                    audio_preprocess_dir=root / "staging",
+                )
+
+            self.assertFalse(cache_hit)
+            self.assertEqual(backend_audio_paths[0].suffix, ".wav")
+            self.assertFalse(backend_audio_paths[0].exists())
+            payload = json.loads(paths["speaker_json"].read_text(encoding="utf-8"))
+            self.assertEqual(payload["source_audio"], str(audio))
 
 
 if __name__ == "__main__":

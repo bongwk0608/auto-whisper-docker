@@ -472,6 +472,8 @@ DIARIZATION_VERBOSE=false
 DIARIZATION_PROGRESS=
 DIARIZATION_TF32=false
 DIARIZATION_OOM_FALLBACK=cpu
+DIARIZATION_AUDIO_PREPROCESS=auto
+DIARIZATION_AUDIO_PREPROCESS_DIR=/tmp/auto-whisper-diarization
 SAFE_OUTPUT_FILENAMES=auto
 PYANNOTE_METRICS_ENABLED=0
 ```
@@ -497,6 +499,14 @@ Pyannote does not diarize Whisper transcript lines one by one. During inference,
 - `cpu` is the default and retries the same file once on CPU after CUDA cleanup. This is slower, but gives the best chance of finishing the full batch.
 - `skip` records the file as failed and continues to the next file.
 - `fail` stops the run immediately.
+
+`DIARIZATION_AUDIO_PREPROCESS` controls whether Pyannote receives the original media file or a temporary 16 kHz mono PCM WAV:
+
+- `auto` is the default and preprocesses compressed/risky formats such as `.m4a`, `.aac`, `.wma`, `.mp4`, `.mov`, `.mkv`, and `.webm`.
+- `always` preprocesses every audio/video file before Pyannote.
+- `false` keeps the previous direct-to-Pyannote behavior.
+
+This is useful for Pyannote crop errors such as `resulted in 440989 samples instead of the expected 441000 samples`. The source file is not renamed or modified; temporary WAV files are written under `DIARIZATION_AUDIO_PREPROCESS_DIR` and removed after each file.
 
 `SAFE_OUTPUT_FILENAMES` controls generated output names:
 
@@ -532,6 +542,7 @@ python scripts/backfill_diarization.py --dry-run
 python scripts/backfill_diarization.py --force
 python scripts/backfill_diarization.py --verbose --progress --tf32 false
 python scripts/backfill_diarization.py --no-progress
+python scripts/backfill_diarization.py --audio-preprocess auto
 python scripts/backfill_diarization.py --min-overlap-ratio 0.3 --min-speakers 1 --max-speakers 5
 ```
 
@@ -544,7 +555,7 @@ python scripts/run_diarization.py \
   --output-dir ./output_pyannote
 ```
 
-Raw pyannote output is cached per source audio, file size, modified time, backend, model, and speaker-count parameters. If `output/` and `output_overall/` reference the same audio, the second pass reuses the cached speaker timeline and reruns only merge/export.
+Raw pyannote output is cached per source audio, file size, modified time, backend, model, speaker-count parameters, and audio preprocessing mode. Existing legacy caches are still recognized. If `output/` and `output_overall/` reference the same audio, the second pass reuses the cached speaker timeline and reruns only merge/export.
 
 For RTX 3050Ti 4GB and similar small-GPU systems, run Whisper and pyannote sequentially:
 
@@ -620,6 +631,8 @@ Important `.env` values:
 - `DIARIZATION_PROGRESS`: empty to follow `DIARIZATION_VERBOSE`, `true` for live pyannote stage progress with percentage/ETA when available, or `false`
 - `DIARIZATION_TF32`: `false` for reproducible pyannote CUDA output, `true` for faster TF32 inference, or `auto` to leave PyTorch defaults unchanged
 - `DIARIZATION_OOM_FALLBACK`: `cpu` to retry CUDA OOM files on CPU, `skip` to continue without retry, or `fail` to stop immediately
+- `DIARIZATION_AUDIO_PREPROCESS`: `auto` to convert risky compressed formats to temporary PCM WAV before pyannote, `always` to convert all files, or `false` for direct input
+- `DIARIZATION_AUDIO_PREPROCESS_DIR`: temporary directory for pyannote preprocessing WAV files
 - `SAFE_OUTPUT_FILENAMES`: `auto` to keep readable names when safe, `true` to always normalize, or `false` to keep original generated names
 - `FINGERPRINT_MODE`: `metadata` for fast network-drive skip checks, or `sha256` for full-file hashing
 - `LOCAL_STAGING`: `true` to copy only pending files to local temporary storage before transcription

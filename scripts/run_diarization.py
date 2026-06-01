@@ -13,6 +13,11 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from diarization.backend import DiarizationConfig, SpeakerSegment
+from diarization.audio_preprocess import (
+    audio_preprocess_cache_tag,
+    parse_audio_preprocess_mode,
+    prepared_pyannote_audio,
+)
 from diarization.export_speaker_transcript import export_speaker_outputs, speaker_outputs_complete
 from diarization.filename_normalization import parse_safe_output_policy
 from diarization.merge_whisper_speakers import MergeConfig, assign_speakers_to_whisper_segments
@@ -100,6 +105,8 @@ def run_single_diarization(
     progress_context: ProgressContext | None = None,
     oom_fallback: str = "cpu",
     filename_policy: str = "auto",
+    audio_preprocess: str = "auto",
+    audio_preprocess_dir: Path = Path("/tmp/auto-whisper-diarization"),
 ) -> tuple[dict[str, Path], bool]:
     started_at = time.perf_counter()
     if speaker_outputs_complete(output_base) and not force:
@@ -119,6 +126,8 @@ def run_single_diarization(
         progress=progress,
         progress_context=progress_context,
         oom_fallback=oom_fallback,
+        audio_preprocess=audio_preprocess,
+        audio_preprocess_dir=audio_preprocess_dir,
     )
 
     paths = export_diarization_from_segments(
@@ -149,9 +158,15 @@ def diarize_with_cache(
     progress: bool = False,
     progress_context: ProgressContext | None = None,
     oom_fallback: str = "cpu",
+    audio_preprocess: str = "auto",
+    audio_preprocess_dir: Path = Path("/tmp/auto-whisper-diarization"),
 ) -> tuple[list[SpeakerSegment], bool]:
-    key = cache_key(audio_path, config)
+    preprocess_tag = audio_preprocess_cache_tag(audio_preprocess, audio_path)
+    key = cache_key(audio_path, config, audio_preprocess=preprocess_tag)
     cached = None if force else load_cached_segments(cache_dir, key)
+    if cached is None and not force:
+        legacy_key = cache_key(audio_path, config)
+        cached = load_cached_segments(cache_dir, legacy_key)
     if cached is not None:
         print(f"Raw diarization cache hit: {audio_path}", flush=True)
         return cached, True
@@ -162,26 +177,27 @@ def diarize_with_cache(
     inference_started_at = time.perf_counter()
     progress_reporter = DiarizationProgressReporter(progress_context) if progress else None
     cleanup_runtime_memory(verbose=verbose, label="Runtime cleanup before file")
-    try:
-        backend = PyannoteDiarizationBackend(config, tf32_mode=tf32_mode, verbose=verbose)
+    with prepared_pyannote_audio(audio_path, audio_preprocess, audio_preprocess_dir, verbose=verbose) as pyannote_audio_path:
         try:
-            speaker_segments = backend.diarize(audio_path, progress_reporter=progress_reporter)
-        finally:
-            del backend
-            cleanup_runtime_memory(verbose=verbose, label="Runtime cleanup after file")
-    except Exception as exc:
-        cleanup_runtime_memory(verbose=verbose, label="Runtime cleanup after failure")
-        if not is_cuda_oom_error(exc):
-            raise
-        if oom_fallback != "cpu":
-            raise DiarizationOutOfMemoryError(str(exc)) from exc
-        print(f"CUDA OOM detected; retrying same audio on CPU: {audio_path}", flush=True)
-        cpu_backend = PyannoteDiarizationBackend(config, device="cpu", tf32_mode=tf32_mode, verbose=verbose)
-        try:
-            speaker_segments = cpu_backend.diarize(audio_path, progress_reporter=progress_reporter)
-        finally:
-            del cpu_backend
-            cleanup_runtime_memory(verbose=verbose, label="Runtime cleanup after CPU fallback")
+            backend = PyannoteDiarizationBackend(config, tf32_mode=tf32_mode, verbose=verbose)
+            try:
+                speaker_segments = backend.diarize(pyannote_audio_path, progress_reporter=progress_reporter)
+            finally:
+                del backend
+                cleanup_runtime_memory(verbose=verbose, label="Runtime cleanup after file")
+        except Exception as exc:
+            cleanup_runtime_memory(verbose=verbose, label="Runtime cleanup after failure")
+            if not is_cuda_oom_error(exc):
+                raise
+            if oom_fallback != "cpu":
+                raise DiarizationOutOfMemoryError(str(exc)) from exc
+            print(f"CUDA OOM detected; retrying same audio on CPU: {audio_path}", flush=True)
+            cpu_backend = PyannoteDiarizationBackend(config, device="cpu", tf32_mode=tf32_mode, verbose=verbose)
+            try:
+                speaker_segments = cpu_backend.diarize(pyannote_audio_path, progress_reporter=progress_reporter)
+            finally:
+                del cpu_backend
+                cleanup_runtime_memory(verbose=verbose, label="Runtime cleanup after CPU fallback")
     if verbose:
         elapsed = time.perf_counter() - inference_started_at
         print(f"Finished Pyannote inference: speakers={len({segment.speaker_label for segment in speaker_segments})} segments={len(speaker_segments)} elapsed={elapsed:.1f}s", flush=True)
@@ -204,6 +220,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--max-speakers", type=int, default=parse_optional_int(os.environ.get("DIARIZATION_MAX_SPEAKERS")))
     parser.add_argument("--cache-dir", type=Path, default=Path(os.environ.get("DIARIZATION_CACHE_DIR", "state/diarization-cache")))
     parser.add_argument("--safe-output-filenames", choices=["auto", "true", "false"], default=parse_safe_output_policy(os.environ.get("SAFE_OUTPUT_FILENAMES")))
+    parser.add_argument("--audio-preprocess", choices=["auto", "always", "false"], default=parse_audio_preprocess_mode(os.environ.get("DIARIZATION_AUDIO_PREPROCESS")))
+    parser.add_argument("--audio-preprocess-dir", type=Path, default=Path(os.environ.get("DIARIZATION_AUDIO_PREPROCESS_DIR", "/tmp/auto-whisper-diarization")))
     parser.add_argument("--tf32", choices=["auto", "true", "false"], default=parse_tf32_mode(os.environ.get("DIARIZATION_TF32")))
     parser.add_argument("--oom-fallback", choices=["cpu", "skip", "fail"], default=parse_oom_fallback(os.environ.get("DIARIZATION_OOM_FALLBACK")))
     parser.add_argument("--verbose", action="store_true", default=parse_bool(os.environ.get("DIARIZATION_VERBOSE"), False))
@@ -242,6 +260,8 @@ def main() -> int:
         ProgressContext(file_index=1, file_total=1),
         args.oom_fallback,
         args.safe_output_filenames,
+        args.audio_preprocess,
+        args.audio_preprocess_dir,
     )
     for name, path in paths.items():
         print(f"{name}: {path}", flush=True)
