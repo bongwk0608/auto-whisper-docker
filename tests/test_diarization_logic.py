@@ -154,7 +154,7 @@ class DiarizationLogicTests(unittest.TestCase):
             self.assertEqual(cached, [SpeakerSegment(0.0, 1.0, "Speaker_00")])
 
     def test_audio_preprocess_policy_modes(self) -> None:
-        self.assertEqual(parse_audio_preprocess_mode(None), "auto")
+        self.assertEqual(parse_audio_preprocess_mode(None), "always")
         self.assertTrue(should_preprocess_audio(Path("audio.m4a"), "auto"))
         self.assertTrue(should_preprocess_audio(Path("video.mp4"), "auto"))
         self.assertFalse(should_preprocess_audio(Path("audio.wav"), "auto"))
@@ -328,6 +328,7 @@ class DiarizationLogicTests(unittest.TestCase):
                     0.3,
                     root / "cache",
                     oom_fallback="cpu",
+                    audio_preprocess="false",
                 )
 
             self.assertFalse(cache_hit)

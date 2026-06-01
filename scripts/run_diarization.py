@@ -105,7 +105,7 @@ def run_single_diarization(
     progress_context: ProgressContext | None = None,
     oom_fallback: str = "cpu",
     filename_policy: str = "auto",
-    audio_preprocess: str = "auto",
+    audio_preprocess: str = "always",
     audio_preprocess_dir: Path = Path("/tmp/auto-whisper-diarization"),
 ) -> tuple[dict[str, Path], bool]:
     started_at = time.perf_counter()
@@ -158,7 +158,7 @@ def diarize_with_cache(
     progress: bool = False,
     progress_context: ProgressContext | None = None,
     oom_fallback: str = "cpu",
-    audio_preprocess: str = "auto",
+    audio_preprocess: str = "always",
     audio_preprocess_dir: Path = Path("/tmp/auto-whisper-diarization"),
 ) -> tuple[list[SpeakerSegment], bool]:
     preprocess_tag = audio_preprocess_cache_tag(audio_preprocess, audio_path)

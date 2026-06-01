@@ -234,7 +234,7 @@ def process_transcript_set(
     progress: bool = False,
     oom_fallback: str = "cpu",
     filename_policy: str = "auto",
-    audio_preprocess: str = "auto",
+    audio_preprocess: str = "always",
     audio_preprocess_dir: Path = Path("/tmp/auto-whisper-diarization"),
 ) -> tuple[int, int, int, int]:
     completed = 0
@@ -346,7 +346,7 @@ def process_state_output_jobs(
     progress: bool = False,
     oom_fallback: str = "cpu",
     filename_policy: str = "auto",
-    audio_preprocess: str = "auto",
+    audio_preprocess: str = "always",
     audio_preprocess_dir: Path = Path("/tmp/auto-whisper-diarization"),
 ) -> tuple[int, int, int, int]:
     completed = 0

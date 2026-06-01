@@ -34,7 +34,7 @@ RISKY_AUDIO_EXTENSIONS = {
 
 
 def parse_audio_preprocess_mode(value: str | None) -> str:
-    mode = (value or "auto").strip().lower()
+    mode = (value or "always").strip().lower()
     if mode not in {"auto", "always", "false"}:
         raise ValueError("DIARIZATION_AUDIO_PREPROCESS must be one of: auto, always, false")
     return mode
