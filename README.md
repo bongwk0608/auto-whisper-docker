@@ -474,6 +474,8 @@ DIARIZATION_TF32=false
 DIARIZATION_OOM_FALLBACK=cpu
 DIARIZATION_CUDA_QUARANTINE_AFTER_OOM=false
 DIARIZATION_CUDA_DEBUG_ERRORS=false
+DIARIZATION_WORKER_MODE=always
+DIARIZATION_GPU_MEMORY_LOG=false
 DIARIZATION_AUDIO_PREPROCESS=always
 DIARIZATION_AUDIO_PREPROCESS_DIR=/tmp/auto-whisper-diarization
 SAFE_OUTPUT_FILENAMES=auto
@@ -503,6 +505,14 @@ Pyannote does not diarize Whisper transcript lines one by one. During inference,
 - `fail` stops the run immediately.
 
 `DIARIZATION_CUDA_QUARANTINE_AFTER_OOM=false` is the default and retries CUDA on each new uncached file after a hard cleanup, while still retrying the OOM file itself on CPU. Set it to `true` for conservative survival mode, where remaining uncached files run on CPU after the first hard OOM. `DIARIZATION_CUDA_DEBUG_ERRORS=false` keeps CUDA cleanup logs concise; set it to `true` only when you need the full CUDA diagnostic text.
+
+`DIARIZATION_WORKER_MODE` controls whether Pyannote inference runs inside the main backfill process or a short-lived worker process:
+
+- `always` is the default and runs every uncached Pyannote inference in a worker process for the strongest practical VRAM/RAM release.
+- `on_oom` is the faster hybrid mode: start in-process, then use worker isolation for later CUDA attempts after the first CUDA OOM.
+- `false` keeps all inference in the main Python process.
+
+In WSL + Docker, `torch.cuda.empty_cache()` can release PyTorch's cache, but only process exit reliably destroys that process's CUDA context. Worker mode uses that process boundary to release VRAM more aggressively. Small NVIDIA driver/context reservations may still remain visible. Set `DIARIZATION_GPU_MEMORY_LOG=true` to log `nvidia-smi` memory around worker starts/exits when available.
 
 `DIARIZATION_AUDIO_PREPROCESS` controls whether Pyannote receives the original media file or a temporary 16 kHz mono PCM WAV:
 
@@ -637,6 +647,8 @@ Important `.env` values:
 - `DIARIZATION_OOM_FALLBACK`: `cpu` to retry CUDA OOM files on CPU, `skip` to continue without retry, or `fail` to stop immediately
 - `DIARIZATION_CUDA_QUARANTINE_AFTER_OOM`: `false` to retry CUDA on each new uncached file after cleanup, or `true` to switch remaining uncached files to CPU after the first CUDA OOM
 - `DIARIZATION_CUDA_DEBUG_ERRORS`: `false` for concise CUDA cleanup warnings, or `true` for full CUDA exception details
+- `DIARIZATION_WORKER_MODE`: `always` to isolate every uncached inference, `on_oom` to enable worker isolation after the first CUDA OOM, or `false` for in-process inference
+- `DIARIZATION_GPU_MEMORY_LOG`: `true` to log `nvidia-smi` memory around worker processes, or `false`
 - `DIARIZATION_AUDIO_PREPROCESS`: `always` to convert all files to temporary PCM WAV before pyannote, `auto` to convert only risky compressed formats, or `false` for direct input
 - `DIARIZATION_AUDIO_PREPROCESS_DIR`: temporary directory for pyannote preprocessing WAV files
 - `SAFE_OUTPUT_FILENAMES`: `auto` to keep readable names when safe, `true` to always normalize, or `false` to keep original generated names

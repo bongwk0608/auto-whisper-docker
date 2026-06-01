@@ -29,12 +29,14 @@ from diarization.pyannote_runner import (
     cleanup_cuda_memory,
     is_cuda_oom_error,
     parse_cuda_quarantine_after_oom,
+    parse_gpu_memory_log,
     parse_oom_fallback,
+    parse_worker_mode,
     prepare_next_file_cuda_attempt,
 )
 from diarization.raw_cache import cache_key, load_cached_segments, save_cached_segments
 from scripts.backfill_diarization import process_transcript_set
-from scripts.run_diarization import diarize_with_cache, run_single_diarization
+from scripts.run_diarization import diarize_with_cache, run_pyannote_worker, run_single_diarization
 
 
 class DiarizationLogicTests(unittest.TestCase):
@@ -300,6 +302,34 @@ class DiarizationLogicTests(unittest.TestCase):
         self.assertEqual(parse_oom_fallback("skip"), "skip")
         self.assertFalse(parse_cuda_quarantine_after_oom(None))
         self.assertTrue(parse_cuda_quarantine_after_oom("true"))
+        self.assertEqual(parse_worker_mode(None), "always")
+        self.assertEqual(parse_worker_mode("always"), "always")
+        self.assertFalse(parse_gpu_memory_log(None))
+        self.assertTrue(parse_gpu_memory_log("true"))
+
+    def test_run_pyannote_worker_reads_completed_segments(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            audio = root / "audio.wav"
+            audio.write_bytes(b"audio")
+
+            def fake_run(command, capture_output, text, check):
+                out = Path(command[command.index("--cache-out") + 1])
+                out.write_text(
+                    json.dumps(
+                        {
+                            "status": "completed",
+                            "speaker_segments": [{"start": 0.0, "end": 1.0, "speaker_label": "SPEAKER_00"}],
+                        }
+                    ),
+                    encoding="utf-8",
+                )
+                return mock.Mock(returncode=0, stdout="", stderr="")
+
+            with mock.patch("scripts.run_diarization.subprocess.run", side_effect=fake_run):
+                segments = run_pyannote_worker(audio, DiarizationConfig(), "cuda", "false", False, False)
+
+            self.assertEqual(segments, [SpeakerSegment(0.0, 1.0, "SPEAKER_00")])
 
     def test_cuda_cleanup_is_best_effort(self) -> None:
         fake_torch = mock.Mock()
@@ -391,6 +421,7 @@ class DiarizationLogicTests(unittest.TestCase):
                     audio_preprocess="false",
                     runtime_state=state,
                     cuda_quarantine_after_oom=True,
+                    worker_mode="false",
                 )
                 diarize_with_cache(
                     second,
@@ -399,6 +430,7 @@ class DiarizationLogicTests(unittest.TestCase):
                     audio_preprocess="false",
                     runtime_state=state,
                     cuda_quarantine_after_oom=True,
+                    worker_mode="false",
                 )
 
             self.assertEqual(devices, [None, "cpu", "cpu"])
@@ -437,6 +469,7 @@ class DiarizationLogicTests(unittest.TestCase):
                     audio_preprocess="false",
                     runtime_state=state,
                     cuda_quarantine_after_oom=False,
+                    worker_mode="false",
                 )
                 diarize_with_cache(
                     second,
@@ -445,6 +478,7 @@ class DiarizationLogicTests(unittest.TestCase):
                     audio_preprocess="false",
                     runtime_state=state,
                     cuda_quarantine_after_oom=False,
+                    worker_mode="false",
                 )
 
             self.assertEqual(devices, [None, "cpu", None])
@@ -493,6 +527,130 @@ class DiarizationLogicTests(unittest.TestCase):
             self.assertTrue(cache_hit)
             self.assertEqual(segments, [SpeakerSegment(0.0, 1.0, "SPEAKER_00")])
             backend.assert_not_called()
+
+    def test_worker_mode_cache_hit_does_not_spawn_worker(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            audio = root / "audio.mp3"
+            audio.write_bytes(b"audio")
+            config = DiarizationConfig()
+            key = cache_key(audio, config, audio_preprocess="direct:false")
+            save_cached_segments(root / "cache", key, audio, config, [SpeakerSegment(0.0, 1.0, "SPEAKER_00")])
+
+            with mock.patch("scripts.run_diarization.subprocess.run") as run:
+                segments, cache_hit = diarize_with_cache(
+                    audio,
+                    config,
+                    root / "cache",
+                    audio_preprocess="false",
+                    worker_mode="always",
+                )
+
+            self.assertTrue(cache_hit)
+            self.assertEqual(segments, [SpeakerSegment(0.0, 1.0, "SPEAKER_00")])
+            run.assert_not_called()
+
+    def test_worker_mode_always_uses_worker_for_success(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            audio = root / "audio.mp3"
+            audio.write_bytes(b"audio")
+            devices: list[str] = []
+
+            def fake_worker(audio_path, config, device, tf32_mode, verbose, gpu_memory_log):
+                devices.append(device)
+                return [SpeakerSegment(0.0, 1.0, "SPEAKER_00")]
+
+            with mock.patch("scripts.run_diarization.run_pyannote_worker", side_effect=fake_worker):
+                segments, cache_hit = diarize_with_cache(
+                    audio,
+                    DiarizationConfig(),
+                    root / "cache",
+                    audio_preprocess="false",
+                    worker_mode="always",
+                )
+
+            self.assertFalse(cache_hit)
+            self.assertEqual(devices, ["cuda"])
+            self.assertEqual(segments, [SpeakerSegment(0.0, 1.0, "SPEAKER_00")])
+
+    def test_cuda_worker_oom_retries_cpu_worker_for_same_file(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            audio = root / "audio.mp3"
+            audio.write_bytes(b"audio")
+            devices: list[str] = []
+
+            def fake_worker(audio_path, config, device, tf32_mode, verbose, gpu_memory_log):
+                devices.append(device)
+                if device == "cuda":
+                    raise RuntimeError("CUDA error: out of memory")
+                return [SpeakerSegment(0.0, 1.0, "SPEAKER_00")]
+
+            with mock.patch("scripts.run_diarization.run_pyannote_worker", side_effect=fake_worker):
+                segments, cache_hit = diarize_with_cache(
+                    audio,
+                    DiarizationConfig(),
+                    root / "cache",
+                    audio_preprocess="false",
+                    worker_mode="always",
+                    oom_fallback="cpu",
+                )
+
+            self.assertFalse(cache_hit)
+            self.assertEqual(devices, ["cuda", "cpu"])
+            self.assertEqual(segments, [SpeakerSegment(0.0, 1.0, "SPEAKER_00")])
+
+    def test_on_oom_worker_mode_uses_worker_for_next_cuda_attempt(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            first = root / "first.mp3"
+            second = root / "second.mp3"
+            first.write_bytes(b"first")
+            second.write_bytes(b"second")
+            state = DiarizationRuntimeState()
+            backend_devices: list[str | None] = []
+            worker_devices: list[str] = []
+
+            class FakeBackend:
+                def __init__(self, config, auth_token=None, device=None, tf32_mode=None, verbose=False):
+                    self.device = device
+                    backend_devices.append(device)
+
+                def diarize(self, audio_path, progress_reporter=None):
+                    if self.device is None:
+                        raise RuntimeError("CUDA error: out of memory")
+                    return [SpeakerSegment(0.0, 1.0, "SPEAKER_00")]
+
+            def fake_worker(audio_path, config, device, tf32_mode, verbose, gpu_memory_log):
+                worker_devices.append(device)
+                return [SpeakerSegment(0.0, 1.0, "SPEAKER_01")]
+
+            with (
+                mock.patch("scripts.run_diarization.PyannoteDiarizationBackend", FakeBackend),
+                mock.patch("scripts.run_diarization.run_pyannote_worker", side_effect=fake_worker),
+            ):
+                diarize_with_cache(
+                    first,
+                    DiarizationConfig(),
+                    root / "cache",
+                    audio_preprocess="false",
+                    worker_mode="on_oom",
+                    runtime_state=state,
+                )
+                segments, _cache_hit = diarize_with_cache(
+                    second,
+                    DiarizationConfig(),
+                    root / "cache",
+                    audio_preprocess="false",
+                    worker_mode="on_oom",
+                    runtime_state=state,
+                    cuda_quarantine_after_oom=False,
+                )
+
+            self.assertEqual(backend_devices, [None, "cpu"])
+            self.assertEqual(worker_devices, ["cuda"])
+            self.assertEqual(segments, [SpeakerSegment(0.0, 1.0, "SPEAKER_01")])
 
     def test_cpu_target_skips_tf32_configuration(self) -> None:
         fake_torch = mock.Mock()

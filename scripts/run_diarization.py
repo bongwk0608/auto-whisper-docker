@@ -3,7 +3,9 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import subprocess
 import sys
+import tempfile
 import time
 from pathlib import Path
 from typing import Any
@@ -29,8 +31,10 @@ from diarization.pyannote_runner import (
     cleanup_runtime_memory,
     is_cuda_oom_error,
     parse_cuda_quarantine_after_oom,
+    parse_gpu_memory_log,
     parse_oom_fallback,
     parse_tf32_mode,
+    parse_worker_mode,
     prepare_next_file_cuda_attempt,
 )
 from diarization.raw_cache import cache_key, load_cached_segments, save_cached_segments
@@ -54,6 +58,95 @@ def load_whisper_json(path: Path) -> dict[str, Any]:
     if not isinstance(data, dict) or not isinstance(data.get("segments"), list):
         raise ValueError(f"Whisper JSON does not contain a segments list: {path}")
     return data
+
+
+def speaker_segments_from_dicts(items: list[dict[str, Any]]) -> list[SpeakerSegment]:
+    return [
+        SpeakerSegment(float(item["start"]), float(item["end"]), str(item["speaker_label"]))
+        for item in items
+    ]
+
+
+def log_gpu_memory(label: str, enabled: bool) -> None:
+    if not enabled:
+        return
+    try:
+        completed = subprocess.run(
+            [
+                "nvidia-smi",
+                "--query-gpu=memory.used,memory.total",
+                "--format=csv,noheader,nounits",
+            ],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+    except OSError as exc:
+        print(f"GPU memory {label}: unavailable ({exc})", flush=True)
+        return
+    if completed.returncode != 0:
+        message = (completed.stderr or completed.stdout or "nvidia-smi failed").strip()
+        print(f"GPU memory {label}: unavailable ({message})", flush=True)
+        return
+    print(f"GPU memory {label}: {completed.stdout.strip()} MiB used/total", flush=True)
+
+
+def run_pyannote_worker(
+    audio_path: Path,
+    config: DiarizationConfig,
+    device: str,
+    tf32_mode: str | None,
+    verbose: bool,
+    gpu_memory_log: bool,
+) -> list[SpeakerSegment]:
+    with tempfile.TemporaryDirectory(prefix="pyannote-worker-") as temp_dir:
+        output_path = Path(temp_dir) / "segments.json"
+        command = [
+            sys.executable,
+            str(ROOT / "scripts" / "pyannote_worker.py"),
+            "--audio",
+            str(audio_path),
+            "--cache-out",
+            str(output_path),
+            "--device",
+            device,
+            "--backend",
+            config.backend,
+            "--model",
+            config.model,
+            "--tf32",
+            parse_tf32_mode(tf32_mode),
+        ]
+        if config.num_speakers is not None:
+            command.extend(["--num-speakers", str(config.num_speakers)])
+        if config.min_speakers is not None:
+            command.extend(["--min-speakers", str(config.min_speakers)])
+        if config.max_speakers is not None:
+            command.extend(["--max-speakers", str(config.max_speakers)])
+        if verbose:
+            command.append("--verbose")
+            print(f"Starting Pyannote worker: device={device}", flush=True)
+        log_gpu_memory(f"before worker {device}", gpu_memory_log)
+        completed = subprocess.run(command, capture_output=True, text=True, check=False)
+        if completed.stdout:
+            print(completed.stdout, end="" if completed.stdout.endswith("\n") else "\n", flush=True)
+        if completed.stderr:
+            print(completed.stderr, end="" if completed.stderr.endswith("\n") else "\n", file=sys.stderr, flush=True)
+        log_gpu_memory(f"after worker {device}", gpu_memory_log)
+        payload: dict[str, Any] = {}
+        if output_path.exists():
+            payload = json.loads(output_path.read_text(encoding="utf-8"))
+        if completed.returncode != 0 or payload.get("status") != "completed":
+            message = str(payload.get("error_message") or completed.stderr or completed.stdout or "Pyannote worker failed")
+            if payload.get("is_cuda_oom"):
+                raise RuntimeError(f"CUDA error: out of memory ({message})")
+            raise RuntimeError(message)
+        if verbose:
+            print("Pyannote worker exited: status=completed", flush=True)
+        segments = payload.get("speaker_segments", [])
+        if not isinstance(segments, list):
+            raise RuntimeError("Pyannote worker returned invalid speaker_segments")
+        return speaker_segments_from_dicts(segments)
 
 
 def export_diarization_from_segments(
@@ -112,6 +205,8 @@ def run_single_diarization(
     audio_preprocess_dir: Path = Path("/tmp/auto-whisper-diarization"),
     runtime_state: DiarizationRuntimeState | None = None,
     cuda_quarantine_after_oom: bool = True,
+    worker_mode: str = "on_oom",
+    gpu_memory_log: bool = False,
 ) -> tuple[dict[str, Path], bool]:
     started_at = time.perf_counter()
     if speaker_outputs_complete(output_base) and not force:
@@ -135,6 +230,8 @@ def run_single_diarization(
         audio_preprocess_dir=audio_preprocess_dir,
         runtime_state=runtime_state,
         cuda_quarantine_after_oom=cuda_quarantine_after_oom,
+        worker_mode=worker_mode,
+        gpu_memory_log=gpu_memory_log,
     )
 
     paths = export_diarization_from_segments(
@@ -169,6 +266,8 @@ def diarize_with_cache(
     audio_preprocess_dir: Path = Path("/tmp/auto-whisper-diarization"),
     runtime_state: DiarizationRuntimeState | None = None,
     cuda_quarantine_after_oom: bool = True,
+    worker_mode: str = "on_oom",
+    gpu_memory_log: bool = False,
 ) -> tuple[list[SpeakerSegment], bool]:
     if runtime_state is None:
         runtime_state = DiarizationRuntimeState()
@@ -194,29 +293,55 @@ def diarize_with_cache(
             device = None if runtime_state.cuda_healthy else "cpu"
             if verbose and device == "cpu" and runtime_state.cuda_oom_quarantined:
                 print("CUDA is quarantined; running Pyannote on CPU", flush=True)
-            backend = PyannoteDiarizationBackend(config, device=device, tf32_mode=tf32_mode, verbose=verbose)
-            try:
-                speaker_segments = backend.diarize(pyannote_audio_path, progress_reporter=progress_reporter)
-            finally:
-                del backend
-                cleanup_runtime_memory(verbose=verbose, label="Runtime cleanup after file")
+            use_worker = worker_mode == "always" or (worker_mode == "on_oom" and runtime_state.use_worker_after_oom)
+            if use_worker:
+                worker_device = device or "cuda"
+                speaker_segments = run_pyannote_worker(
+                    pyannote_audio_path,
+                    config,
+                    worker_device,
+                    tf32_mode,
+                    verbose,
+                    gpu_memory_log,
+                )
+                cleanup_runtime_memory(verbose=verbose, label="Runtime cleanup after worker")
+            else:
+                backend = PyannoteDiarizationBackend(config, device=device, tf32_mode=tf32_mode, verbose=verbose)
+                try:
+                    speaker_segments = backend.diarize(pyannote_audio_path, progress_reporter=progress_reporter)
+                finally:
+                    del backend
+                    cleanup_runtime_memory(verbose=verbose, label="Runtime cleanup after file")
         except Exception as exc:
             cleanup_runtime_memory(verbose=verbose, label="Runtime cleanup after failure")
             if not is_cuda_oom_error(exc):
                 raise
             if oom_fallback != "cpu":
                 raise DiarizationOutOfMemoryError(str(exc)) from exc
+            if worker_mode == "on_oom":
+                runtime_state.use_worker_after_oom = True
             if cuda_quarantine_after_oom and runtime_state.cuda_healthy:
                 runtime_state.cuda_healthy = False
                 runtime_state.cuda_oom_quarantined = True
                 print("CUDA marked unhealthy after OOM; remaining uncached files will use CPU", flush=True)
             print(f"CUDA OOM detected; retrying same audio on CPU: {audio_path}", flush=True)
-            cpu_backend = PyannoteDiarizationBackend(config, device="cpu", tf32_mode=tf32_mode, verbose=verbose)
-            try:
-                speaker_segments = cpu_backend.diarize(pyannote_audio_path, progress_reporter=progress_reporter)
-            finally:
-                del cpu_backend
-                cleanup_runtime_memory(verbose=verbose, label="Runtime cleanup after CPU fallback")
+            if worker_mode == "always":
+                speaker_segments = run_pyannote_worker(
+                    pyannote_audio_path,
+                    config,
+                    "cpu",
+                    tf32_mode,
+                    verbose,
+                    gpu_memory_log,
+                )
+                cleanup_runtime_memory(verbose=verbose, label="Runtime cleanup after CPU worker fallback")
+            else:
+                cpu_backend = PyannoteDiarizationBackend(config, device="cpu", tf32_mode=tf32_mode, verbose=verbose)
+                try:
+                    speaker_segments = cpu_backend.diarize(pyannote_audio_path, progress_reporter=progress_reporter)
+                finally:
+                    del cpu_backend
+                    cleanup_runtime_memory(verbose=verbose, label="Runtime cleanup after CPU fallback")
     if verbose:
         elapsed = time.perf_counter() - inference_started_at
         print(f"Finished Pyannote inference: speakers={len({segment.speaker_label for segment in speaker_segments})} segments={len(speaker_segments)} elapsed={elapsed:.1f}s", flush=True)
@@ -245,6 +370,9 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--oom-fallback", choices=["cpu", "skip", "fail"], default=parse_oom_fallback(os.environ.get("DIARIZATION_OOM_FALLBACK")))
     parser.add_argument("--cuda-quarantine-after-oom", action="store_true", default=parse_cuda_quarantine_after_oom(os.environ.get("DIARIZATION_CUDA_QUARANTINE_AFTER_OOM")))
     parser.add_argument("--no-cuda-quarantine-after-oom", dest="cuda_quarantine_after_oom", action="store_false")
+    parser.add_argument("--worker-mode", choices=["false", "on_oom", "always"], default=parse_worker_mode(os.environ.get("DIARIZATION_WORKER_MODE")))
+    parser.add_argument("--gpu-memory-log", action="store_true", default=parse_gpu_memory_log(os.environ.get("DIARIZATION_GPU_MEMORY_LOG")))
+    parser.add_argument("--no-gpu-memory-log", dest="gpu_memory_log", action="store_false")
     parser.add_argument("--verbose", action="store_true", default=parse_bool(os.environ.get("DIARIZATION_VERBOSE"), False))
     progress_default = parse_progress_enabled(os.environ.get("DIARIZATION_PROGRESS"), parse_bool(os.environ.get("DIARIZATION_VERBOSE"), False))
     parser.add_argument("--progress", dest="progress", action="store_true", default=progress_default)
@@ -285,6 +413,8 @@ def main() -> int:
         args.audio_preprocess_dir,
         DiarizationRuntimeState(),
         args.cuda_quarantine_after_oom,
+        args.worker_mode,
+        args.gpu_memory_log,
     )
     for name, path in paths.items():
         print(f"{name}: {path}", flush=True)

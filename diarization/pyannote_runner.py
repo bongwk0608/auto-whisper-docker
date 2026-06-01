@@ -22,6 +22,7 @@ class DiarizationOutOfMemoryError(RuntimeError):
 class DiarizationRuntimeState:
     cuda_healthy: bool = True
     cuda_oom_quarantined: bool = False
+    use_worker_after_oom: bool = False
 
 
 def parse_cuda_quarantine_after_oom(value: str | None) -> bool:
@@ -31,6 +32,19 @@ def parse_cuda_quarantine_after_oom(value: str | None) -> bool:
 
 
 def parse_cuda_debug_errors(value: str | None) -> bool:
+    if value is None or value == "":
+        return False
+    return value.strip().lower() in {"1", "true", "yes", "y", "on"}
+
+
+def parse_worker_mode(value: str | None) -> str:
+    mode = (value or "always").strip().lower()
+    if mode not in {"false", "on_oom", "always"}:
+        raise ValueError("DIARIZATION_WORKER_MODE must be one of: false, on_oom, always")
+    return mode
+
+
+def parse_gpu_memory_log(value: str | None) -> bool:
     if value is None or value == "":
         return False
     return value.strip().lower() in {"1", "true", "yes", "y", "on"}
