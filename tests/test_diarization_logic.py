@@ -319,7 +319,20 @@ class DiarizationLogicTests(unittest.TestCase):
             audio = root / "audio.wav"
             audio.write_bytes(b"audio")
 
-            def fake_run(command, capture_output, text, check, timeout=None):
+            class FakeProcess:
+                stdout = iter(["worker line\n"])
+                returncode = 0
+
+                def poll(self):
+                    return self.returncode
+
+                def wait(self, timeout=None):
+                    return self.returncode
+
+                def kill(self):
+                    self.returncode = -9
+
+            def fake_popen(command, stdout, stderr, text, bufsize):
                 out = Path(command[command.index("--cache-out") + 1])
                 out.write_text(
                     json.dumps(
@@ -330,9 +343,9 @@ class DiarizationLogicTests(unittest.TestCase):
                     ),
                     encoding="utf-8",
                 )
-                return mock.Mock(returncode=0, stdout="", stderr="")
+                return FakeProcess()
 
-            with mock.patch("scripts.run_diarization.subprocess.run", side_effect=fake_run):
+            with mock.patch("scripts.run_diarization.subprocess.Popen", side_effect=fake_popen):
                 segments = run_pyannote_worker(audio, DiarizationConfig(), "cuda", "false", False, False)
 
             self.assertEqual(segments, [SpeakerSegment(0.0, 1.0, "SPEAKER_00")])
@@ -343,11 +356,23 @@ class DiarizationLogicTests(unittest.TestCase):
             audio = root / "audio.wav"
             audio.write_bytes(b"audio")
 
-            def fake_run(command, capture_output, text, check, timeout=None):
-                raise TimeoutError("wrong timeout type")
+            class FakeProcess:
+                stdout = iter(())
+                returncode = None
 
-            timeout = __import__("subprocess").TimeoutExpired(["python"], 3, output="out", stderr="err")
-            with mock.patch("scripts.run_diarization.subprocess.run", side_effect=timeout):
+                def poll(self):
+                    return self.returncode
+
+                def wait(self, timeout=None):
+                    return self.returncode
+
+                def kill(self):
+                    self.returncode = -9
+
+            with (
+                mock.patch("scripts.run_diarization.subprocess.Popen", return_value=FakeProcess()),
+                mock.patch("scripts.run_diarization.time.perf_counter", side_effect=[0.0, 4.0]),
+            ):
                 with self.assertRaisesRegex(RuntimeError, "Pyannote worker timed out after 3s"):
                     run_pyannote_worker(
                         audio,
@@ -365,9 +390,25 @@ class DiarizationLogicTests(unittest.TestCase):
             audio = root / "audio.wav"
             audio.write_bytes(b"audio")
 
+            class FakeProcess:
+                stdout = iter(("worker line\n",))
+                returncode = 0
+
+                def poll(self):
+                    return self.returncode
+
+                def wait(self, timeout=None):
+                    return self.returncode
+
+                def kill(self):
+                    self.returncode = -9
+
             def fake_run(command, capture_output, text, check, timeout=None):
                 if command[0] == "nvidia-smi":
                     return mock.Mock(returncode=0, stdout="100, 4096\n", stderr="")
+                return mock.Mock(returncode=1, stdout="", stderr="")
+
+            def fake_popen(command, stdout, stderr, text, bufsize):
                 out = Path(command[command.index("--cache-out") + 1])
                 out.write_text(
                     json.dumps(
@@ -378,10 +419,11 @@ class DiarizationLogicTests(unittest.TestCase):
                     ),
                     encoding="utf-8",
                 )
-                return mock.Mock(returncode=0, stdout="", stderr="")
+                return FakeProcess()
 
             with (
                 mock.patch("scripts.run_diarization.subprocess.run", side_effect=fake_run) as run,
+                mock.patch("scripts.run_diarization.subprocess.Popen", side_effect=fake_popen),
                 mock.patch("scripts.run_diarization.time.sleep") as sleep,
                 mock.patch("builtins.print"),
             ):
@@ -397,7 +439,30 @@ class DiarizationLogicTests(unittest.TestCase):
                 )
 
             sleep.assert_called()
-            self.assertGreaterEqual(run.call_count, 4)
+            self.assertGreaterEqual(run.call_count, 3)
+
+    def test_run_pyannote_worker_failure_uses_output_tail_without_json(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            audio = root / "audio.wav"
+            audio.write_bytes(b"audio")
+
+            class FakeProcess:
+                stdout = iter(("first worker line\n", "last worker error\n"))
+                returncode = 1
+
+                def poll(self):
+                    return self.returncode
+
+                def wait(self, timeout=None):
+                    return self.returncode
+
+                def kill(self):
+                    self.returncode = -9
+
+            with mock.patch("scripts.run_diarization.subprocess.Popen", return_value=FakeProcess()):
+                with self.assertRaisesRegex(RuntimeError, "last worker error"):
+                    run_pyannote_worker(audio, DiarizationConfig(), "cuda", "false", False, False)
 
     def test_cuda_cleanup_is_best_effort(self) -> None:
         fake_torch = mock.Mock()

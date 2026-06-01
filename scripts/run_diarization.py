@@ -1,11 +1,14 @@
 from __future__ import annotations
 
 import argparse
+from collections import deque
 import json
 import os
+import queue
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 from pathlib import Path
 from typing import Any
@@ -116,6 +119,16 @@ def wait_for_gpu_memory_settle(wait_seconds: int, enabled: bool, label: str) -> 
     )
 
 
+def _stream_process_output(process: subprocess.Popen[str], output_queue: queue.Queue[str | None]) -> None:
+    try:
+        if process.stdout is None:
+            return
+        for line in process.stdout:
+            output_queue.put(line)
+    finally:
+        output_queue.put(None)
+
+
 def run_pyannote_worker(
     audio_path: Path,
     config: DiarizationConfig,
@@ -164,35 +177,65 @@ def run_pyannote_worker(
             command.append("--verbose")
             print(f"Starting Pyannote worker: device={device} timeout={timeout_seconds}s", flush=True)
         log_gpu_memory(f"before worker {device}", gpu_memory_log)
-        try:
-            completed = subprocess.run(
+        output_tail: deque[str] = deque(maxlen=200)
+        worker_queue: queue.Queue[str | None] = queue.Queue()
+        process = subprocess.Popen(
                 command,
-                capture_output=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
                 text=True,
-                check=False,
-                timeout=timeout_seconds if timeout_seconds > 0 else None,
-            )
-        except subprocess.TimeoutExpired as exc:
-            if exc.stdout:
-                stdout = exc.stdout.decode() if isinstance(exc.stdout, bytes) else exc.stdout
-                print(stdout, end="" if stdout.endswith("\n") else "\n", flush=True)
-            if exc.stderr:
-                stderr = exc.stderr.decode() if isinstance(exc.stderr, bytes) else exc.stderr
-                print(stderr, end="" if stderr.endswith("\n") else "\n", file=sys.stderr, flush=True)
+                bufsize=1,
+        )
+        reader = threading.Thread(target=_stream_process_output, args=(process, worker_queue), daemon=True)
+        reader.start()
+        started_at = time.perf_counter()
+        output_done = False
+        timed_out = False
+        while True:
+            try:
+                line = worker_queue.get(timeout=0.2)
+            except queue.Empty:
+                line = None
+            if line is None:
+                output_done = output_done or not reader.is_alive()
+            else:
+                output_tail.append(line)
+                print(line, end="" if line.endswith("\n") else "\n", flush=True)
+
+            if timeout_seconds > 0 and process.poll() is None and time.perf_counter() - started_at > timeout_seconds:
+                timed_out = True
+                process.kill()
+                break
+            if process.poll() is not None and output_done:
+                break
+
+        try:
+            process.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            process.kill()
+            process.wait()
+        reader.join(timeout=5)
+        while True:
+            try:
+                line = worker_queue.get_nowait()
+            except queue.Empty:
+                break
+            if line is not None:
+                output_tail.append(line)
+                print(line, end="" if line.endswith("\n") else "\n", flush=True)
+
+        if timed_out:
             log_gpu_memory(f"after timed-out worker {device}", gpu_memory_log)
             wait_for_gpu_memory_settle(memory_wait_seconds, gpu_memory_log, f"after timed-out worker {device}")
-            raise RuntimeError(f"Pyannote worker timed out after {timeout_seconds}s: device={device}") from None
-        if completed.stdout:
-            print(completed.stdout, end="" if completed.stdout.endswith("\n") else "\n", flush=True)
-        if completed.stderr:
-            print(completed.stderr, end="" if completed.stderr.endswith("\n") else "\n", file=sys.stderr, flush=True)
+            raise RuntimeError(f"Pyannote worker timed out after {timeout_seconds}s: device={device}")
         log_gpu_memory(f"after worker {device}", gpu_memory_log)
         wait_for_gpu_memory_settle(memory_wait_seconds, gpu_memory_log, f"after worker {device}")
         payload: dict[str, Any] = {}
         if output_path.exists():
             payload = json.loads(output_path.read_text(encoding="utf-8"))
-        if completed.returncode != 0 or payload.get("status") != "completed":
-            message = str(payload.get("error_message") or completed.stderr or completed.stdout or "Pyannote worker failed")
+        if process.returncode != 0 or payload.get("status") != "completed":
+            output_text = "".join(output_tail).strip()
+            message = str(payload.get("error_message") or output_text or "Pyannote worker failed")
             if payload.get("is_cuda_oom"):
                 raise RuntimeError(f"CUDA error: out of memory ({message})")
             raise RuntimeError(message)
