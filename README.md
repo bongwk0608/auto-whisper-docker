@@ -476,6 +476,8 @@ DIARIZATION_CUDA_QUARANTINE_AFTER_OOM=false
 DIARIZATION_CUDA_DEBUG_ERRORS=false
 DIARIZATION_WORKER_MODE=always
 DIARIZATION_GPU_MEMORY_LOG=false
+DIARIZATION_WORKER_TIMEOUT_SECONDS=7200
+DIARIZATION_GPU_MEMORY_WAIT_SECONDS=0
 DIARIZATION_AUDIO_PREPROCESS=always
 DIARIZATION_AUDIO_PREPROCESS_DIR=/tmp/auto-whisper-diarization
 SAFE_OUTPUT_FILENAMES=auto
@@ -512,7 +514,7 @@ Pyannote does not diarize Whisper transcript lines one by one. During inference,
 - `on_oom` is the faster hybrid mode: start in-process, then use worker isolation for later CUDA attempts after the first CUDA OOM.
 - `false` keeps all inference in the main Python process.
 
-In WSL + Docker, `torch.cuda.empty_cache()` can release PyTorch's cache, but only process exit reliably destroys that process's CUDA context. Worker mode uses that process boundary to release VRAM more aggressively. Small NVIDIA driver/context reservations may still remain visible. Set `DIARIZATION_GPU_MEMORY_LOG=true` to log `nvidia-smi` memory around worker starts/exits when available.
+In WSL + Docker, `torch.cuda.empty_cache()` can release PyTorch's cache, but only process exit reliably destroys that process's CUDA context. Worker mode uses that process boundary to release VRAM more aggressively. Small NVIDIA driver/context reservations may still remain visible. Set `DIARIZATION_GPU_MEMORY_LOG=true` to log `nvidia-smi` memory around worker starts/exits when available. `DIARIZATION_WORKER_TIMEOUT_SECONDS=7200` kills a stuck worker after two hours; set `DIARIZATION_GPU_MEMORY_WAIT_SECONDS` above `0` only when you want diagnostics to wait briefly after worker exit for GPU memory accounting to settle.
 
 `DIARIZATION_AUDIO_PREPROCESS` controls whether Pyannote receives the original media file or a temporary 16 kHz mono PCM WAV:
 
@@ -649,6 +651,8 @@ Important `.env` values:
 - `DIARIZATION_CUDA_DEBUG_ERRORS`: `false` for concise CUDA cleanup warnings, or `true` for full CUDA exception details
 - `DIARIZATION_WORKER_MODE`: `always` to isolate every uncached inference, `on_oom` to enable worker isolation after the first CUDA OOM, or `false` for in-process inference
 - `DIARIZATION_GPU_MEMORY_LOG`: `true` to log `nvidia-smi` memory around worker processes, or `false`
+- `DIARIZATION_WORKER_TIMEOUT_SECONDS`: max seconds before a stuck Pyannote worker is killed; `7200` by default, `0` disables the timeout
+- `DIARIZATION_GPU_MEMORY_WAIT_SECONDS`: optional diagnostic wait after worker exit when GPU memory logging is enabled; `0` disables the wait
 - `DIARIZATION_AUDIO_PREPROCESS`: `always` to convert all files to temporary PCM WAV before pyannote, `auto` to convert only risky compressed formats, or `false` for direct input
 - `DIARIZATION_AUDIO_PREPROCESS_DIR`: temporary directory for pyannote preprocessing WAV files
 - `SAFE_OUTPUT_FILENAMES`: `auto` to keep readable names when safe, `true` to always normalize, or `false` to keep original generated names

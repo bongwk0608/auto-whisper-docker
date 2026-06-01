@@ -32,8 +32,10 @@ from diarization.pyannote_runner import (
     is_cuda_oom_error,
     parse_cuda_quarantine_after_oom,
     parse_gpu_memory_log,
+    parse_gpu_memory_wait_seconds,
     parse_oom_fallback,
     parse_tf32_mode,
+    parse_worker_timeout_seconds,
     parse_worker_mode,
     prepare_next_file_cuda_attempt,
 )
@@ -67,9 +69,7 @@ def speaker_segments_from_dicts(items: list[dict[str, Any]]) -> list[SpeakerSegm
     ]
 
 
-def log_gpu_memory(label: str, enabled: bool) -> None:
-    if not enabled:
-        return
+def read_gpu_memory() -> str | None:
     try:
         completed = subprocess.run(
             [
@@ -82,13 +82,38 @@ def log_gpu_memory(label: str, enabled: bool) -> None:
             check=False,
         )
     except OSError as exc:
-        print(f"GPU memory {label}: unavailable ({exc})", flush=True)
-        return
+        return f"unavailable ({exc})"
     if completed.returncode != 0:
         message = (completed.stderr or completed.stdout or "nvidia-smi failed").strip()
-        print(f"GPU memory {label}: unavailable ({message})", flush=True)
+        return f"unavailable ({message})"
+    return f"{completed.stdout.strip()} MiB used/total"
+
+
+def log_gpu_memory(label: str, enabled: bool) -> None:
+    if not enabled:
         return
-    print(f"GPU memory {label}: {completed.stdout.strip()} MiB used/total", flush=True)
+    memory = read_gpu_memory()
+    print(f"GPU memory {label}: {memory}", flush=True)
+
+
+def wait_for_gpu_memory_settle(wait_seconds: int, enabled: bool, label: str) -> None:
+    if not enabled or wait_seconds <= 0:
+        return
+    started_at = time.perf_counter()
+    deadline = started_at + wait_seconds
+    print(
+        f"GPU memory wait {label}: waiting up to {wait_seconds}s for driver/WSL memory accounting to settle",
+        flush=True,
+    )
+    while time.perf_counter() < deadline:
+        time.sleep(min(2.0, max(0.0, deadline - time.perf_counter())))
+    memory = read_gpu_memory()
+    elapsed = time.perf_counter() - started_at
+    print(
+        f"GPU memory wait {label}: completed after {elapsed:.1f}s; current={memory}. "
+        "Small NVIDIA driver/context reservations may remain visible in WSL/Docker.",
+        flush=True,
+    )
 
 
 def run_pyannote_worker(
@@ -98,7 +123,19 @@ def run_pyannote_worker(
     tf32_mode: str | None,
     verbose: bool,
     gpu_memory_log: bool,
+    worker_timeout_seconds: int | None = None,
+    gpu_memory_wait_seconds: int | None = None,
 ) -> list[SpeakerSegment]:
+    timeout_seconds = (
+        parse_worker_timeout_seconds(os.environ.get("DIARIZATION_WORKER_TIMEOUT_SECONDS"))
+        if worker_timeout_seconds is None
+        else worker_timeout_seconds
+    )
+    memory_wait_seconds = (
+        parse_gpu_memory_wait_seconds(os.environ.get("DIARIZATION_GPU_MEMORY_WAIT_SECONDS"))
+        if gpu_memory_wait_seconds is None
+        else gpu_memory_wait_seconds
+    )
     with tempfile.TemporaryDirectory(prefix="pyannote-worker-") as temp_dir:
         output_path = Path(temp_dir) / "segments.json"
         command = [
@@ -125,14 +162,32 @@ def run_pyannote_worker(
             command.extend(["--max-speakers", str(config.max_speakers)])
         if verbose:
             command.append("--verbose")
-            print(f"Starting Pyannote worker: device={device}", flush=True)
+            print(f"Starting Pyannote worker: device={device} timeout={timeout_seconds}s", flush=True)
         log_gpu_memory(f"before worker {device}", gpu_memory_log)
-        completed = subprocess.run(command, capture_output=True, text=True, check=False)
+        try:
+            completed = subprocess.run(
+                command,
+                capture_output=True,
+                text=True,
+                check=False,
+                timeout=timeout_seconds if timeout_seconds > 0 else None,
+            )
+        except subprocess.TimeoutExpired as exc:
+            if exc.stdout:
+                stdout = exc.stdout.decode() if isinstance(exc.stdout, bytes) else exc.stdout
+                print(stdout, end="" if stdout.endswith("\n") else "\n", flush=True)
+            if exc.stderr:
+                stderr = exc.stderr.decode() if isinstance(exc.stderr, bytes) else exc.stderr
+                print(stderr, end="" if stderr.endswith("\n") else "\n", file=sys.stderr, flush=True)
+            log_gpu_memory(f"after timed-out worker {device}", gpu_memory_log)
+            wait_for_gpu_memory_settle(memory_wait_seconds, gpu_memory_log, f"after timed-out worker {device}")
+            raise RuntimeError(f"Pyannote worker timed out after {timeout_seconds}s: device={device}") from None
         if completed.stdout:
             print(completed.stdout, end="" if completed.stdout.endswith("\n") else "\n", flush=True)
         if completed.stderr:
             print(completed.stderr, end="" if completed.stderr.endswith("\n") else "\n", file=sys.stderr, flush=True)
         log_gpu_memory(f"after worker {device}", gpu_memory_log)
+        wait_for_gpu_memory_settle(memory_wait_seconds, gpu_memory_log, f"after worker {device}")
         payload: dict[str, Any] = {}
         if output_path.exists():
             payload = json.loads(output_path.read_text(encoding="utf-8"))
@@ -205,8 +260,10 @@ def run_single_diarization(
     audio_preprocess_dir: Path = Path("/tmp/auto-whisper-diarization"),
     runtime_state: DiarizationRuntimeState | None = None,
     cuda_quarantine_after_oom: bool = True,
-    worker_mode: str = "on_oom",
+    worker_mode: str = "always",
     gpu_memory_log: bool = False,
+    worker_timeout_seconds: int = 7200,
+    gpu_memory_wait_seconds: int = 0,
 ) -> tuple[dict[str, Path], bool]:
     started_at = time.perf_counter()
     if speaker_outputs_complete(output_base) and not force:
@@ -232,6 +289,8 @@ def run_single_diarization(
         cuda_quarantine_after_oom=cuda_quarantine_after_oom,
         worker_mode=worker_mode,
         gpu_memory_log=gpu_memory_log,
+        worker_timeout_seconds=worker_timeout_seconds,
+        gpu_memory_wait_seconds=gpu_memory_wait_seconds,
     )
 
     paths = export_diarization_from_segments(
@@ -266,8 +325,10 @@ def diarize_with_cache(
     audio_preprocess_dir: Path = Path("/tmp/auto-whisper-diarization"),
     runtime_state: DiarizationRuntimeState | None = None,
     cuda_quarantine_after_oom: bool = True,
-    worker_mode: str = "on_oom",
+    worker_mode: str = "always",
     gpu_memory_log: bool = False,
+    worker_timeout_seconds: int = 7200,
+    gpu_memory_wait_seconds: int = 0,
 ) -> tuple[list[SpeakerSegment], bool]:
     if runtime_state is None:
         runtime_state = DiarizationRuntimeState()
@@ -303,6 +364,8 @@ def diarize_with_cache(
                     tf32_mode,
                     verbose,
                     gpu_memory_log,
+                    worker_timeout_seconds,
+                    gpu_memory_wait_seconds,
                 )
                 cleanup_runtime_memory(verbose=verbose, label="Runtime cleanup after worker")
             else:
@@ -333,6 +396,8 @@ def diarize_with_cache(
                     tf32_mode,
                     verbose,
                     gpu_memory_log,
+                    worker_timeout_seconds,
+                    gpu_memory_wait_seconds,
                 )
                 cleanup_runtime_memory(verbose=verbose, label="Runtime cleanup after CPU worker fallback")
             else:
@@ -373,6 +438,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--worker-mode", choices=["false", "on_oom", "always"], default=parse_worker_mode(os.environ.get("DIARIZATION_WORKER_MODE")))
     parser.add_argument("--gpu-memory-log", action="store_true", default=parse_gpu_memory_log(os.environ.get("DIARIZATION_GPU_MEMORY_LOG")))
     parser.add_argument("--no-gpu-memory-log", dest="gpu_memory_log", action="store_false")
+    parser.add_argument("--worker-timeout-seconds", type=parse_worker_timeout_seconds, default=parse_worker_timeout_seconds(os.environ.get("DIARIZATION_WORKER_TIMEOUT_SECONDS")))
+    parser.add_argument("--gpu-memory-wait-seconds", type=parse_gpu_memory_wait_seconds, default=parse_gpu_memory_wait_seconds(os.environ.get("DIARIZATION_GPU_MEMORY_WAIT_SECONDS")))
     parser.add_argument("--verbose", action="store_true", default=parse_bool(os.environ.get("DIARIZATION_VERBOSE"), False))
     progress_default = parse_progress_enabled(os.environ.get("DIARIZATION_PROGRESS"), parse_bool(os.environ.get("DIARIZATION_VERBOSE"), False))
     parser.add_argument("--progress", dest="progress", action="store_true", default=progress_default)
@@ -415,6 +482,8 @@ def main() -> int:
         args.cuda_quarantine_after_oom,
         args.worker_mode,
         args.gpu_memory_log,
+        args.worker_timeout_seconds,
+        args.gpu_memory_wait_seconds,
     )
     for name, path in paths.items():
         print(f"{name}: {path}", flush=True)

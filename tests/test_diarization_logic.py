@@ -30,7 +30,9 @@ from diarization.pyannote_runner import (
     is_cuda_oom_error,
     parse_cuda_quarantine_after_oom,
     parse_gpu_memory_log,
+    parse_gpu_memory_wait_seconds,
     parse_oom_fallback,
+    parse_worker_timeout_seconds,
     parse_worker_mode,
     prepare_next_file_cuda_attempt,
 )
@@ -306,6 +308,10 @@ class DiarizationLogicTests(unittest.TestCase):
         self.assertEqual(parse_worker_mode("always"), "always")
         self.assertFalse(parse_gpu_memory_log(None))
         self.assertTrue(parse_gpu_memory_log("true"))
+        self.assertEqual(parse_worker_timeout_seconds(None), 7200)
+        self.assertEqual(parse_worker_timeout_seconds("0"), 0)
+        self.assertEqual(parse_gpu_memory_wait_seconds(None), 0)
+        self.assertEqual(parse_gpu_memory_wait_seconds("5"), 5)
 
     def test_run_pyannote_worker_reads_completed_segments(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -313,7 +319,7 @@ class DiarizationLogicTests(unittest.TestCase):
             audio = root / "audio.wav"
             audio.write_bytes(b"audio")
 
-            def fake_run(command, capture_output, text, check):
+            def fake_run(command, capture_output, text, check, timeout=None):
                 out = Path(command[command.index("--cache-out") + 1])
                 out.write_text(
                     json.dumps(
@@ -330,6 +336,68 @@ class DiarizationLogicTests(unittest.TestCase):
                 segments = run_pyannote_worker(audio, DiarizationConfig(), "cuda", "false", False, False)
 
             self.assertEqual(segments, [SpeakerSegment(0.0, 1.0, "SPEAKER_00")])
+
+    def test_run_pyannote_worker_timeout_records_string_error(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            audio = root / "audio.wav"
+            audio.write_bytes(b"audio")
+
+            def fake_run(command, capture_output, text, check, timeout=None):
+                raise TimeoutError("wrong timeout type")
+
+            timeout = __import__("subprocess").TimeoutExpired(["python"], 3, output="out", stderr="err")
+            with mock.patch("scripts.run_diarization.subprocess.run", side_effect=timeout):
+                with self.assertRaisesRegex(RuntimeError, "Pyannote worker timed out after 3s"):
+                    run_pyannote_worker(
+                        audio,
+                        DiarizationConfig(),
+                        "cuda",
+                        "false",
+                        False,
+                        False,
+                        worker_timeout_seconds=3,
+                    )
+
+    def test_run_pyannote_worker_waits_for_gpu_memory_when_enabled(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            audio = root / "audio.wav"
+            audio.write_bytes(b"audio")
+
+            def fake_run(command, capture_output, text, check, timeout=None):
+                if command[0] == "nvidia-smi":
+                    return mock.Mock(returncode=0, stdout="100, 4096\n", stderr="")
+                out = Path(command[command.index("--cache-out") + 1])
+                out.write_text(
+                    json.dumps(
+                        {
+                            "status": "completed",
+                            "speaker_segments": [{"start": 0.0, "end": 1.0, "speaker_label": "SPEAKER_00"}],
+                        }
+                    ),
+                    encoding="utf-8",
+                )
+                return mock.Mock(returncode=0, stdout="", stderr="")
+
+            with (
+                mock.patch("scripts.run_diarization.subprocess.run", side_effect=fake_run) as run,
+                mock.patch("scripts.run_diarization.time.sleep") as sleep,
+                mock.patch("builtins.print"),
+            ):
+                run_pyannote_worker(
+                    audio,
+                    DiarizationConfig(),
+                    "cuda",
+                    "false",
+                    False,
+                    True,
+                    worker_timeout_seconds=10,
+                    gpu_memory_wait_seconds=2,
+                )
+
+            sleep.assert_called()
+            self.assertGreaterEqual(run.call_count, 4)
 
     def test_cuda_cleanup_is_best_effort(self) -> None:
         fake_torch = mock.Mock()
@@ -386,6 +454,7 @@ class DiarizationLogicTests(unittest.TestCase):
                     root / "cache",
                     oom_fallback="cpu",
                     audio_preprocess="false",
+                    worker_mode="false",
                 )
 
             self.assertFalse(cache_hit)
@@ -557,7 +626,7 @@ class DiarizationLogicTests(unittest.TestCase):
             audio.write_bytes(b"audio")
             devices: list[str] = []
 
-            def fake_worker(audio_path, config, device, tf32_mode, verbose, gpu_memory_log):
+            def fake_worker(audio_path, config, device, tf32_mode, verbose, gpu_memory_log, worker_timeout_seconds=7200, gpu_memory_wait_seconds=0):
                 devices.append(device)
                 return [SpeakerSegment(0.0, 1.0, "SPEAKER_00")]
 
@@ -581,7 +650,7 @@ class DiarizationLogicTests(unittest.TestCase):
             audio.write_bytes(b"audio")
             devices: list[str] = []
 
-            def fake_worker(audio_path, config, device, tf32_mode, verbose, gpu_memory_log):
+            def fake_worker(audio_path, config, device, tf32_mode, verbose, gpu_memory_log, worker_timeout_seconds=7200, gpu_memory_wait_seconds=0):
                 devices.append(device)
                 if device == "cuda":
                     raise RuntimeError("CUDA error: out of memory")
@@ -622,7 +691,7 @@ class DiarizationLogicTests(unittest.TestCase):
                         raise RuntimeError("CUDA error: out of memory")
                     return [SpeakerSegment(0.0, 1.0, "SPEAKER_00")]
 
-            def fake_worker(audio_path, config, device, tf32_mode, verbose, gpu_memory_log):
+            def fake_worker(audio_path, config, device, tf32_mode, verbose, gpu_memory_log, worker_timeout_seconds=7200, gpu_memory_wait_seconds=0):
                 worker_devices.append(device)
                 return [SpeakerSegment(0.0, 1.0, "SPEAKER_01")]
 
@@ -698,6 +767,7 @@ class DiarizationLogicTests(unittest.TestCase):
                     root / "cache",
                     audio_preprocess="auto",
                     audio_preprocess_dir=root / "staging",
+                    worker_mode="false",
                 )
 
             self.assertFalse(cache_hit)

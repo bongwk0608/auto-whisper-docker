@@ -25,9 +25,11 @@ from diarization.pyannote_runner import (
     PyannoteDiarizationBackend,
     cleanup_runtime_memory,
     parse_gpu_memory_log,
+    parse_gpu_memory_wait_seconds,
     parse_cuda_quarantine_after_oom,
     parse_oom_fallback,
     parse_tf32_mode,
+    parse_worker_timeout_seconds,
     parse_worker_mode,
 )
 from scripts.run_diarization import (
@@ -242,8 +244,10 @@ def process_transcript_set(
     audio_preprocess_dir: Path = Path("/tmp/auto-whisper-diarization"),
     runtime_state: DiarizationRuntimeState | None = None,
     cuda_quarantine_after_oom: bool = True,
-    worker_mode: str = "on_oom",
+    worker_mode: str = "always",
     gpu_memory_log: bool = False,
+    worker_timeout_seconds: int = 7200,
+    gpu_memory_wait_seconds: int = 0,
 ) -> tuple[int, int, int, int]:
     if runtime_state is None:
         runtime_state = DiarizationRuntimeState()
@@ -329,6 +333,8 @@ def process_transcript_set(
                 cuda_quarantine_after_oom=cuda_quarantine_after_oom,
                 worker_mode=worker_mode,
                 gpu_memory_log=gpu_memory_log,
+                worker_timeout_seconds=worker_timeout_seconds,
+                gpu_memory_wait_seconds=gpu_memory_wait_seconds,
             )
             completed += 1
             update_job(manifest, key, "completed", whisper_json, output_base, audio_path, output_paths, cache_hit=cache_hit)
@@ -364,8 +370,10 @@ def process_state_output_jobs(
     audio_preprocess_dir: Path = Path("/tmp/auto-whisper-diarization"),
     runtime_state: DiarizationRuntimeState | None = None,
     cuda_quarantine_after_oom: bool = True,
-    worker_mode: str = "on_oom",
+    worker_mode: str = "always",
     gpu_memory_log: bool = False,
+    worker_timeout_seconds: int = 7200,
+    gpu_memory_wait_seconds: int = 0,
 ) -> tuple[int, int, int, int]:
     if runtime_state is None:
         runtime_state = DiarizationRuntimeState()
@@ -447,6 +455,8 @@ def process_state_output_jobs(
                 cuda_quarantine_after_oom=cuda_quarantine_after_oom,
                 worker_mode=worker_mode,
                 gpu_memory_log=gpu_memory_log,
+                worker_timeout_seconds=worker_timeout_seconds,
+                gpu_memory_wait_seconds=gpu_memory_wait_seconds,
             )
             combined_output_paths: dict[str, Path] = {}
             for target_index, target in enumerate(pending_targets, start=1):
@@ -514,6 +524,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--worker-mode", choices=["false", "on_oom", "always"], default=parse_worker_mode(os.environ.get("DIARIZATION_WORKER_MODE")))
     parser.add_argument("--gpu-memory-log", action="store_true", default=parse_gpu_memory_log(os.environ.get("DIARIZATION_GPU_MEMORY_LOG")))
     parser.add_argument("--no-gpu-memory-log", dest="gpu_memory_log", action="store_false")
+    parser.add_argument("--worker-timeout-seconds", type=parse_worker_timeout_seconds, default=parse_worker_timeout_seconds(os.environ.get("DIARIZATION_WORKER_TIMEOUT_SECONDS")))
+    parser.add_argument("--gpu-memory-wait-seconds", type=parse_gpu_memory_wait_seconds, default=parse_gpu_memory_wait_seconds(os.environ.get("DIARIZATION_GPU_MEMORY_WAIT_SECONDS")))
     parser.add_argument("--verbose", action="store_true", default=parse_bool(os.environ.get("DIARIZATION_VERBOSE"), False))
     progress_default = parse_progress_enabled(os.environ.get("DIARIZATION_PROGRESS"), parse_bool(os.environ.get("DIARIZATION_VERBOSE"), False))
     parser.add_argument("--progress", dest="progress", action="store_true", default=progress_default)
@@ -539,6 +551,7 @@ def main() -> int:
             f"audio_preprocess={args.audio_preprocess} "
             f"cuda_quarantine_after_oom={args.cuda_quarantine_after_oom} "
             f"worker_mode={args.worker_mode} gpu_memory_log={args.gpu_memory_log} dry_run={args.dry_run}",
+            f"worker_timeout_seconds={args.worker_timeout_seconds} gpu_memory_wait_seconds={args.gpu_memory_wait_seconds}",
             flush=True,
         )
         if not args.dry_run:
@@ -580,6 +593,8 @@ def main() -> int:
                 args.cuda_quarantine_after_oom,
                 args.worker_mode,
                 args.gpu_memory_log,
+                args.worker_timeout_seconds,
+                args.gpu_memory_wait_seconds,
             )
             totals = [completed, skipped, missing_audio, failed]
         else:
@@ -611,6 +626,8 @@ def main() -> int:
                     args.cuda_quarantine_after_oom,
                     args.worker_mode,
                     args.gpu_memory_log,
+                    args.worker_timeout_seconds,
+                    args.gpu_memory_wait_seconds,
                 )
                 totals[0] += completed
                 totals[1] += skipped

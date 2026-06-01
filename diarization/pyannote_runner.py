@@ -50,6 +50,24 @@ def parse_gpu_memory_log(value: str | None) -> bool:
     return value.strip().lower() in {"1", "true", "yes", "y", "on"}
 
 
+def parse_worker_timeout_seconds(value: str | None) -> int:
+    if value is None or value == "":
+        return 7200
+    timeout_seconds = int(value)
+    if timeout_seconds < 0:
+        raise ValueError("DIARIZATION_WORKER_TIMEOUT_SECONDS must be zero or greater")
+    return timeout_seconds
+
+
+def parse_gpu_memory_wait_seconds(value: str | None) -> int:
+    if value is None or value == "":
+        return 0
+    wait_seconds = int(value)
+    if wait_seconds < 0:
+        raise ValueError("DIARIZATION_GPU_MEMORY_WAIT_SECONDS must be zero or greater")
+    return wait_seconds
+
+
 def parse_tf32_mode(value: str | None) -> str:
     mode = (value or "false").strip().lower()
     if mode not in {"auto", "true", "false"}:
