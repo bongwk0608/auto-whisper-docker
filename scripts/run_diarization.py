@@ -24,11 +24,14 @@ from diarization.merge_whisper_speakers import MergeConfig, assign_speakers_to_w
 from diarization.progress import DiarizationProgressReporter, ProgressContext, parse_progress_enabled
 from diarization.pyannote_runner import (
     DiarizationOutOfMemoryError,
+    DiarizationRuntimeState,
     PyannoteDiarizationBackend,
     cleanup_runtime_memory,
     is_cuda_oom_error,
+    parse_cuda_quarantine_after_oom,
     parse_oom_fallback,
     parse_tf32_mode,
+    prepare_next_file_cuda_attempt,
 )
 from diarization.raw_cache import cache_key, load_cached_segments, save_cached_segments
 
@@ -107,6 +110,8 @@ def run_single_diarization(
     filename_policy: str = "auto",
     audio_preprocess: str = "always",
     audio_preprocess_dir: Path = Path("/tmp/auto-whisper-diarization"),
+    runtime_state: DiarizationRuntimeState | None = None,
+    cuda_quarantine_after_oom: bool = True,
 ) -> tuple[dict[str, Path], bool]:
     started_at = time.perf_counter()
     if speaker_outputs_complete(output_base) and not force:
@@ -128,6 +133,8 @@ def run_single_diarization(
         oom_fallback=oom_fallback,
         audio_preprocess=audio_preprocess,
         audio_preprocess_dir=audio_preprocess_dir,
+        runtime_state=runtime_state,
+        cuda_quarantine_after_oom=cuda_quarantine_after_oom,
     )
 
     paths = export_diarization_from_segments(
@@ -160,7 +167,11 @@ def diarize_with_cache(
     oom_fallback: str = "cpu",
     audio_preprocess: str = "always",
     audio_preprocess_dir: Path = Path("/tmp/auto-whisper-diarization"),
+    runtime_state: DiarizationRuntimeState | None = None,
+    cuda_quarantine_after_oom: bool = True,
 ) -> tuple[list[SpeakerSegment], bool]:
+    if runtime_state is None:
+        runtime_state = DiarizationRuntimeState()
     preprocess_tag = audio_preprocess_cache_tag(audio_preprocess, audio_path)
     key = cache_key(audio_path, config, audio_preprocess=preprocess_tag)
     cached = None if force else load_cached_segments(cache_dir, key)
@@ -171,6 +182,7 @@ def diarize_with_cache(
         print(f"Raw diarization cache hit: {audio_path}", flush=True)
         return cached, True
 
+    prepare_next_file_cuda_attempt(runtime_state, cuda_quarantine_after_oom, verbose=verbose)
     print(f"Raw diarization cache miss: {audio_path}", flush=True)
     if verbose:
         print(f"Starting Pyannote inference: model={config.model} audio={audio_path}", flush=True)
@@ -179,7 +191,10 @@ def diarize_with_cache(
     cleanup_runtime_memory(verbose=verbose, label="Runtime cleanup before file")
     with prepared_pyannote_audio(audio_path, audio_preprocess, audio_preprocess_dir, verbose=verbose) as pyannote_audio_path:
         try:
-            backend = PyannoteDiarizationBackend(config, tf32_mode=tf32_mode, verbose=verbose)
+            device = None if runtime_state.cuda_healthy else "cpu"
+            if verbose and device == "cpu" and runtime_state.cuda_oom_quarantined:
+                print("CUDA is quarantined; running Pyannote on CPU", flush=True)
+            backend = PyannoteDiarizationBackend(config, device=device, tf32_mode=tf32_mode, verbose=verbose)
             try:
                 speaker_segments = backend.diarize(pyannote_audio_path, progress_reporter=progress_reporter)
             finally:
@@ -191,6 +206,10 @@ def diarize_with_cache(
                 raise
             if oom_fallback != "cpu":
                 raise DiarizationOutOfMemoryError(str(exc)) from exc
+            if cuda_quarantine_after_oom and runtime_state.cuda_healthy:
+                runtime_state.cuda_healthy = False
+                runtime_state.cuda_oom_quarantined = True
+                print("CUDA marked unhealthy after OOM; remaining uncached files will use CPU", flush=True)
             print(f"CUDA OOM detected; retrying same audio on CPU: {audio_path}", flush=True)
             cpu_backend = PyannoteDiarizationBackend(config, device="cpu", tf32_mode=tf32_mode, verbose=verbose)
             try:
@@ -224,6 +243,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--audio-preprocess-dir", type=Path, default=Path(os.environ.get("DIARIZATION_AUDIO_PREPROCESS_DIR", "/tmp/auto-whisper-diarization")))
     parser.add_argument("--tf32", choices=["auto", "true", "false"], default=parse_tf32_mode(os.environ.get("DIARIZATION_TF32")))
     parser.add_argument("--oom-fallback", choices=["cpu", "skip", "fail"], default=parse_oom_fallback(os.environ.get("DIARIZATION_OOM_FALLBACK")))
+    parser.add_argument("--cuda-quarantine-after-oom", action="store_true", default=parse_cuda_quarantine_after_oom(os.environ.get("DIARIZATION_CUDA_QUARANTINE_AFTER_OOM")))
+    parser.add_argument("--no-cuda-quarantine-after-oom", dest="cuda_quarantine_after_oom", action="store_false")
     parser.add_argument("--verbose", action="store_true", default=parse_bool(os.environ.get("DIARIZATION_VERBOSE"), False))
     progress_default = parse_progress_enabled(os.environ.get("DIARIZATION_PROGRESS"), parse_bool(os.environ.get("DIARIZATION_VERBOSE"), False))
     parser.add_argument("--progress", dest="progress", action="store_true", default=progress_default)
@@ -262,6 +283,8 @@ def main() -> int:
         args.safe_output_filenames,
         args.audio_preprocess,
         args.audio_preprocess_dir,
+        DiarizationRuntimeState(),
+        args.cuda_quarantine_after_oom,
     )
     for name, path in paths.items():
         print(f"{name}: {path}", flush=True)

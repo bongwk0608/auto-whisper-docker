@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import os
 import gc
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
@@ -15,6 +16,24 @@ class PyannoteModelAccessError(RuntimeError):
 
 class DiarizationOutOfMemoryError(RuntimeError):
     pass
+
+
+@dataclass
+class DiarizationRuntimeState:
+    cuda_healthy: bool = True
+    cuda_oom_quarantined: bool = False
+
+
+def parse_cuda_quarantine_after_oom(value: str | None) -> bool:
+    if value is None or value == "":
+        return False
+    return value.strip().lower() in {"1", "true", "yes", "y", "on"}
+
+
+def parse_cuda_debug_errors(value: str | None) -> bool:
+    if value is None or value == "":
+        return False
+    return value.strip().lower() in {"1", "true", "yes", "y", "on"}
 
 
 def parse_tf32_mode(value: str | None) -> str:
@@ -47,6 +66,8 @@ def cleanup_runtime_memory(verbose: bool = False, label: str | None = None) -> N
     if not torch.cuda.is_available():
         gc.collect()
         return
+    failed_operations: list[str] = []
+    failed_details: list[str] = []
     for operation_name, operation in [
         ("synchronize", torch.cuda.synchronize),
         ("empty_cache", torch.cuda.empty_cache),
@@ -57,15 +78,39 @@ def cleanup_runtime_memory(verbose: bool = False, label: str | None = None) -> N
         try:
             operation()
         except Exception as exc:
-            if verbose:
-                print(f"CUDA cleanup {operation_name} skipped after error: {exc}", flush=True)
+            failed_operations.append(operation_name)
+            failed_details.append(f"{operation_name}: {exc}")
     gc.collect()
     if verbose:
+        if failed_operations:
+            failed_text = ", ".join(failed_operations)
+            joined_details = "\n".join(failed_details).lower()
+            reason = "after OOM" if "out of memory" in joined_details else "after error"
+            print(f"CUDA cleanup skipped {reason}: {failed_text}", flush=True)
+            if parse_cuda_debug_errors(os.environ.get("DIARIZATION_CUDA_DEBUG_ERRORS")):
+                for detail in failed_details:
+                    print(f"CUDA cleanup detail: {detail}", flush=True)
         print("Runtime cleanup completed", flush=True)
 
 
 def cleanup_cuda_memory(verbose: bool = False) -> None:
     cleanup_runtime_memory(verbose=verbose)
+
+
+def prepare_next_file_cuda_attempt(
+    runtime_state: DiarizationRuntimeState,
+    cuda_quarantine_after_oom: bool,
+    verbose: bool = False,
+) -> None:
+    if runtime_state.cuda_healthy:
+        return
+    if cuda_quarantine_after_oom and runtime_state.cuda_oom_quarantined:
+        return
+    cleanup_runtime_memory(verbose=verbose, label="Runtime cleanup before CUDA retry")
+    runtime_state.cuda_healthy = True
+    runtime_state.cuda_oom_quarantined = False
+    if verbose:
+        print("CUDA will be retried for next file after runtime cleanup", flush=True)
 
 
 class PyannoteDiarizationBackend:
@@ -86,11 +131,10 @@ class PyannoteDiarizationBackend:
             raise RuntimeError("PYANNOTE_AUTH_TOKEN is required for pyannote diarization.")
 
     def diarize(self, audio_path: Path, progress_reporter: DiarizationProgressReporter | None = None) -> list[SpeakerSegment]:
-        pipeline, torch = self.load_pipeline()
-        target_device = self.device or ("cuda" if torch.cuda.is_available() else "cpu")
+        pipeline, torch, target_device = self.load_pipeline()
         if hasattr(pipeline, "to"):
             pipeline.to(torch.device(target_device))
-        self.configure_tf32(torch, "before inference")
+        self.configure_tf32(torch, "before inference", target_device)
 
         kwargs: dict[str, int] = {}
         if self.config.num_speakers is not None:
@@ -140,18 +184,19 @@ class PyannoteDiarizationBackend:
         with ProgressHook():
             return pipeline(str(audio_path), hook=ProjectProgressHook(progress_reporter), **kwargs)
 
-    def load_pipeline(self) -> tuple[Any, Any]:
+    def load_pipeline(self) -> tuple[Any, Any, str]:
         try:
             from pyannote.audio import Pipeline
             import torch
         except ImportError as exc:
             raise RuntimeError("pyannote.audio, torch, and torchaudio must be installed for diarization.") from exc
 
-        self.log_torch_startup(torch)
-        self.configure_tf32(torch, "before pipeline load")
+        target_device = self.device or ("cuda" if torch.cuda.is_available() else "cpu")
+        self.log_torch_startup(torch, target_device)
+        self.configure_tf32(torch, "before pipeline load", target_device)
 
         try:
-            return Pipeline.from_pretrained(self.config.model, token=self.auth_token), torch
+            return Pipeline.from_pretrained(self.config.model, token=self.auth_token), torch, target_device
         except Exception as exc:
             message = str(exc)
             if "Cannot access gated repo" in message or "403" in message or "gated" in message.lower():
@@ -164,11 +209,15 @@ class PyannoteDiarizationBackend:
             raise
 
     def validate_access(self) -> None:
-        pipeline, _torch = self.load_pipeline()
+        pipeline, _torch, _target_device = self.load_pipeline()
         del pipeline
         cleanup_cuda_memory(verbose=self.verbose)
 
-    def configure_tf32(self, torch: Any, stage: str) -> None:
+    def configure_tf32(self, torch: Any, stage: str, target_device: str) -> None:
+        if target_device != "cuda":
+            if self.verbose:
+                print(f"Pyannote TF32 skipped {stage}: target_device={target_device}", flush=True)
+            return
         if not torch.cuda.is_available():
             if self.verbose:
                 print(f"Pyannote TF32 {stage}: CUDA unavailable, mode={self.tf32_mode}", flush=True)
@@ -192,13 +241,15 @@ class PyannoteDiarizationBackend:
                 flush=True,
             )
 
-    def log_torch_startup(self, torch: Any) -> None:
+    def log_torch_startup(self, torch: Any, target_device: str) -> None:
         if not self.verbose:
             return
         cuda_available = torch.cuda.is_available()
         gpu_name = torch.cuda.get_device_name(0) if cuda_available else "none"
+        cuda_unused = cuda_available and target_device != "cuda"
         print(
-            f"Pyannote startup: model={self.config.model} cuda_available={cuda_available} "
-            f"gpu={gpu_name} tf32_mode={self.tf32_mode} verbose={self.verbose}",
+            f"Pyannote startup: model={self.config.model} target_device={target_device} "
+            f"cuda_available={cuda_available} gpu={gpu_name} cuda_unused={cuda_unused} "
+            f"tf32_mode={self.tf32_mode} verbose={self.verbose}",
             flush=True,
         )

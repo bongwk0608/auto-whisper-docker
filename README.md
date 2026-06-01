@@ -472,6 +472,8 @@ DIARIZATION_VERBOSE=false
 DIARIZATION_PROGRESS=
 DIARIZATION_TF32=false
 DIARIZATION_OOM_FALLBACK=cpu
+DIARIZATION_CUDA_QUARANTINE_AFTER_OOM=false
+DIARIZATION_CUDA_DEBUG_ERRORS=false
 DIARIZATION_AUDIO_PREPROCESS=always
 DIARIZATION_AUDIO_PREPROCESS_DIR=/tmp/auto-whisper-diarization
 SAFE_OUTPUT_FILENAMES=auto
@@ -499,6 +501,8 @@ Pyannote does not diarize Whisper transcript lines one by one. During inference,
 - `cpu` is the default and retries the same file once on CPU after CUDA cleanup. This is slower, but gives the best chance of finishing the full batch.
 - `skip` records the file as failed and continues to the next file.
 - `fail` stops the run immediately.
+
+`DIARIZATION_CUDA_QUARANTINE_AFTER_OOM=false` is the default and retries CUDA on each new uncached file after a hard cleanup, while still retrying the OOM file itself on CPU. Set it to `true` for conservative survival mode, where remaining uncached files run on CPU after the first hard OOM. `DIARIZATION_CUDA_DEBUG_ERRORS=false` keeps CUDA cleanup logs concise; set it to `true` only when you need the full CUDA diagnostic text.
 
 `DIARIZATION_AUDIO_PREPROCESS` controls whether Pyannote receives the original media file or a temporary 16 kHz mono PCM WAV:
 
@@ -631,6 +635,8 @@ Important `.env` values:
 - `DIARIZATION_PROGRESS`: empty to follow `DIARIZATION_VERBOSE`, `true` for live pyannote stage progress with percentage/ETA when available, or `false`
 - `DIARIZATION_TF32`: `false` for reproducible pyannote CUDA output, `true` for faster TF32 inference, or `auto` to leave PyTorch defaults unchanged
 - `DIARIZATION_OOM_FALLBACK`: `cpu` to retry CUDA OOM files on CPU, `skip` to continue without retry, or `fail` to stop immediately
+- `DIARIZATION_CUDA_QUARANTINE_AFTER_OOM`: `false` to retry CUDA on each new uncached file after cleanup, or `true` to switch remaining uncached files to CPU after the first CUDA OOM
+- `DIARIZATION_CUDA_DEBUG_ERRORS`: `false` for concise CUDA cleanup warnings, or `true` for full CUDA exception details
 - `DIARIZATION_AUDIO_PREPROCESS`: `always` to convert all files to temporary PCM WAV before pyannote, `auto` to convert only risky compressed formats, or `false` for direct input
 - `DIARIZATION_AUDIO_PREPROCESS_DIR`: temporary directory for pyannote preprocessing WAV files
 - `SAFE_OUTPUT_FILENAMES`: `auto` to keep readable names when safe, `true` to always normalize, or `false` to keep original generated names

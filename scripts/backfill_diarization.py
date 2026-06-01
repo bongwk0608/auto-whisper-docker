@@ -20,9 +20,11 @@ from diarization.manifest import load_manifest, manifest_key, save_manifest, upd
 from diarization.progress import ProgressContext, parse_progress_enabled
 from diarization.pyannote_runner import (
     DiarizationOutOfMemoryError,
+    DiarizationRuntimeState,
     PyannoteModelAccessError,
     PyannoteDiarizationBackend,
     cleanup_runtime_memory,
+    parse_cuda_quarantine_after_oom,
     parse_oom_fallback,
     parse_tf32_mode,
 )
@@ -236,7 +238,11 @@ def process_transcript_set(
     filename_policy: str = "auto",
     audio_preprocess: str = "always",
     audio_preprocess_dir: Path = Path("/tmp/auto-whisper-diarization"),
+    runtime_state: DiarizationRuntimeState | None = None,
+    cuda_quarantine_after_oom: bool = True,
 ) -> tuple[int, int, int, int]:
+    if runtime_state is None:
+        runtime_state = DiarizationRuntimeState()
     completed = 0
     skipped = 0
     missing_audio = 0
@@ -315,6 +321,8 @@ def process_transcript_set(
                 filename_policy=filename_policy,
                 audio_preprocess=audio_preprocess,
                 audio_preprocess_dir=audio_preprocess_dir,
+                runtime_state=runtime_state,
+                cuda_quarantine_after_oom=cuda_quarantine_after_oom,
             )
             completed += 1
             update_job(manifest, key, "completed", whisper_json, output_base, audio_path, output_paths, cache_hit=cache_hit)
@@ -348,7 +356,11 @@ def process_state_output_jobs(
     filename_policy: str = "auto",
     audio_preprocess: str = "always",
     audio_preprocess_dir: Path = Path("/tmp/auto-whisper-diarization"),
+    runtime_state: DiarizationRuntimeState | None = None,
+    cuda_quarantine_after_oom: bool = True,
 ) -> tuple[int, int, int, int]:
+    if runtime_state is None:
+        runtime_state = DiarizationRuntimeState()
     completed = 0
     skipped = 0
     missing_audio = 0
@@ -423,6 +435,8 @@ def process_state_output_jobs(
                 oom_fallback=oom_fallback,
                 audio_preprocess=audio_preprocess,
                 audio_preprocess_dir=audio_preprocess_dir,
+                runtime_state=runtime_state,
+                cuda_quarantine_after_oom=cuda_quarantine_after_oom,
             )
             combined_output_paths: dict[str, Path] = {}
             for target_index, target in enumerate(pending_targets, start=1):
@@ -485,6 +499,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--max-speakers", type=int, default=parse_optional_int(os.environ.get("DIARIZATION_MAX_SPEAKERS")))
     parser.add_argument("--tf32", choices=["auto", "true", "false"], default=parse_tf32_mode(os.environ.get("DIARIZATION_TF32")))
     parser.add_argument("--oom-fallback", choices=["cpu", "skip", "fail"], default=parse_oom_fallback(os.environ.get("DIARIZATION_OOM_FALLBACK")))
+    parser.add_argument("--cuda-quarantine-after-oom", action="store_true", default=parse_cuda_quarantine_after_oom(os.environ.get("DIARIZATION_CUDA_QUARANTINE_AFTER_OOM")))
+    parser.add_argument("--no-cuda-quarantine-after-oom", dest="cuda_quarantine_after_oom", action="store_false")
     parser.add_argument("--verbose", action="store_true", default=parse_bool(os.environ.get("DIARIZATION_VERBOSE"), False))
     progress_default = parse_progress_enabled(os.environ.get("DIARIZATION_PROGRESS"), parse_bool(os.environ.get("DIARIZATION_VERBOSE"), False))
     parser.add_argument("--progress", dest="progress", action="store_true", default=progress_default)
@@ -507,7 +523,8 @@ def main() -> int:
             f"Diarization startup: model={config.model} verbose={args.verbose} "
             f"progress={args.progress and not args.dry_run} tf32={args.tf32} "
             f"oom_fallback={args.oom_fallback} filename_policy={args.safe_output_filenames} "
-            f"audio_preprocess={args.audio_preprocess} dry_run={args.dry_run}",
+            f"audio_preprocess={args.audio_preprocess} "
+            f"cuda_quarantine_after_oom={args.cuda_quarantine_after_oom} dry_run={args.dry_run}",
             flush=True,
         )
         if not args.dry_run:
@@ -519,6 +536,7 @@ def main() -> int:
 
         manifest = load_manifest(args.manifest_path)
         totals = [0, 0, 0, 0]
+        runtime_state = DiarizationRuntimeState()
         jobs = build_state_output_jobs(
             args.state_path,
             args.transcripts_dir,
@@ -544,6 +562,8 @@ def main() -> int:
                 args.safe_output_filenames,
                 args.audio_preprocess,
                 args.audio_preprocess_dir,
+                runtime_state,
+                args.cuda_quarantine_after_oom,
             )
             totals = [completed, skipped, missing_audio, failed]
         else:
@@ -571,6 +591,8 @@ def main() -> int:
                     args.safe_output_filenames,
                     args.audio_preprocess,
                     args.audio_preprocess_dir,
+                    runtime_state,
+                    args.cuda_quarantine_after_oom,
                 )
                 totals[0] += completed
                 totals[1] += skipped

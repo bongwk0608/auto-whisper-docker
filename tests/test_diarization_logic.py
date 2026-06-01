@@ -23,10 +23,18 @@ from diarization.filename_normalization import (
 )
 from diarization.merge_whisper_speakers import MULTI_SPEAKER_POSSIBLE, assign_speakers_to_whisper_segments
 from diarization.progress import DiarizationProgressReporter, ProgressContext, format_duration
-from diarization.pyannote_runner import PyannoteDiarizationBackend, cleanup_cuda_memory, is_cuda_oom_error, parse_oom_fallback
+from diarization.pyannote_runner import (
+    DiarizationRuntimeState,
+    PyannoteDiarizationBackend,
+    cleanup_cuda_memory,
+    is_cuda_oom_error,
+    parse_cuda_quarantine_after_oom,
+    parse_oom_fallback,
+    prepare_next_file_cuda_attempt,
+)
 from diarization.raw_cache import cache_key, load_cached_segments, save_cached_segments
 from scripts.backfill_diarization import process_transcript_set
-from scripts.run_diarization import run_single_diarization
+from scripts.run_diarization import diarize_with_cache, run_single_diarization
 
 
 class DiarizationLogicTests(unittest.TestCase):
@@ -290,6 +298,8 @@ class DiarizationLogicTests(unittest.TestCase):
         self.assertTrue(is_cuda_oom_error(RuntimeError("GET was unable to find an engine to execute this computation")))
         self.assertEqual(parse_oom_fallback(None), "cpu")
         self.assertEqual(parse_oom_fallback("skip"), "skip")
+        self.assertFalse(parse_cuda_quarantine_after_oom(None))
+        self.assertTrue(parse_cuda_quarantine_after_oom("true"))
 
     def test_cuda_cleanup_is_best_effort(self) -> None:
         fake_torch = mock.Mock()
@@ -298,6 +308,23 @@ class DiarizationLogicTests(unittest.TestCase):
 
         with mock.patch.dict("sys.modules", {"torch": fake_torch}):
             cleanup_cuda_memory(verbose=True)
+
+    def test_cuda_cleanup_summarizes_errors_without_debug_details(self) -> None:
+        fake_torch = mock.Mock()
+        fake_torch.cuda.is_available.return_value = True
+        fake_torch.cuda.synchronize.side_effect = RuntimeError("CUDA error: out of memory\nfull diagnostic")
+        fake_torch.cuda.empty_cache.side_effect = RuntimeError("CUDA error: out of memory\nfull diagnostic")
+
+        with (
+            mock.patch.dict("sys.modules", {"torch": fake_torch}),
+            mock.patch.dict("os.environ", {"DIARIZATION_CUDA_DEBUG_ERRORS": "false"}),
+            mock.patch("builtins.print") as printed,
+        ):
+            cleanup_cuda_memory(verbose=True)
+
+        text = "\n".join(str(call.args[0]) for call in printed.call_args_list)
+        self.assertIn("CUDA cleanup skipped after OOM: synchronize, empty_cache", text)
+        self.assertNotIn("full diagnostic", text)
 
     def test_run_single_diarization_retries_cuda_oom_on_cpu(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -334,6 +361,149 @@ class DiarizationLogicTests(unittest.TestCase):
             self.assertFalse(cache_hit)
             self.assertEqual(devices, [None, "cpu"])
             self.assertTrue(paths["speaker_json"].exists())
+
+    def test_cuda_quarantine_makes_next_uncached_file_use_cpu(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            first = root / "first.mp3"
+            second = root / "second.mp3"
+            first.write_bytes(b"first")
+            second.write_bytes(b"second")
+            config = DiarizationConfig()
+            state = DiarizationRuntimeState()
+            devices: list[str | None] = []
+
+            class FakeBackend:
+                def __init__(self, config, auth_token=None, device=None, tf32_mode=None, verbose=False):
+                    self.device = device
+                    devices.append(device)
+
+                def diarize(self, audio_path, progress_reporter=None):
+                    if self.device is None:
+                        raise RuntimeError("CUDA error: out of memory")
+                    return [SpeakerSegment(0.0, 1.0, "SPEAKER_00")]
+
+            with mock.patch("scripts.run_diarization.PyannoteDiarizationBackend", FakeBackend):
+                diarize_with_cache(
+                    first,
+                    config,
+                    root / "cache",
+                    audio_preprocess="false",
+                    runtime_state=state,
+                    cuda_quarantine_after_oom=True,
+                )
+                diarize_with_cache(
+                    second,
+                    config,
+                    root / "cache",
+                    audio_preprocess="false",
+                    runtime_state=state,
+                    cuda_quarantine_after_oom=True,
+                )
+
+            self.assertEqual(devices, [None, "cpu", "cpu"])
+            self.assertFalse(state.cuda_healthy)
+            self.assertTrue(state.cuda_oom_quarantined)
+
+    def test_cuda_quarantine_disabled_retries_cuda_for_next_file(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            first = root / "first.mp3"
+            second = root / "second.mp3"
+            first.write_bytes(b"first")
+            second.write_bytes(b"second")
+            config = DiarizationConfig()
+            state = DiarizationRuntimeState()
+            devices: list[str | None] = []
+            cuda_failures_remaining = 1
+
+            class FakeBackend:
+                def __init__(self, config, auth_token=None, device=None, tf32_mode=None, verbose=False):
+                    self.device = device
+                    devices.append(device)
+
+                def diarize(self, audio_path, progress_reporter=None):
+                    nonlocal cuda_failures_remaining
+                    if self.device is None and cuda_failures_remaining:
+                        cuda_failures_remaining -= 1
+                        raise RuntimeError("CUDA error: out of memory")
+                    return [SpeakerSegment(0.0, 1.0, "SPEAKER_00")]
+
+            with mock.patch("scripts.run_diarization.PyannoteDiarizationBackend", FakeBackend):
+                diarize_with_cache(
+                    first,
+                    config,
+                    root / "cache",
+                    audio_preprocess="false",
+                    runtime_state=state,
+                    cuda_quarantine_after_oom=False,
+                )
+                diarize_with_cache(
+                    second,
+                    config,
+                    root / "cache",
+                    audio_preprocess="false",
+                    runtime_state=state,
+                    cuda_quarantine_after_oom=False,
+                )
+
+            self.assertEqual(devices, [None, "cpu", None])
+            self.assertTrue(state.cuda_healthy)
+            self.assertFalse(state.cuda_oom_quarantined)
+
+    def test_pre_file_reset_restores_cuda_when_quarantine_disabled(self) -> None:
+        state = DiarizationRuntimeState(cuda_healthy=False, cuda_oom_quarantined=False)
+
+        with mock.patch("diarization.pyannote_runner.cleanup_runtime_memory") as cleanup:
+            prepare_next_file_cuda_attempt(state, cuda_quarantine_after_oom=False, verbose=True)
+
+        cleanup.assert_called_once()
+        self.assertTrue(state.cuda_healthy)
+        self.assertFalse(state.cuda_oom_quarantined)
+
+    def test_pre_file_reset_keeps_cpu_when_quarantined(self) -> None:
+        state = DiarizationRuntimeState(cuda_healthy=False, cuda_oom_quarantined=True)
+
+        with mock.patch("diarization.pyannote_runner.cleanup_runtime_memory") as cleanup:
+            prepare_next_file_cuda_attempt(state, cuda_quarantine_after_oom=True, verbose=True)
+
+        cleanup.assert_not_called()
+        self.assertFalse(state.cuda_healthy)
+        self.assertTrue(state.cuda_oom_quarantined)
+
+    def test_cache_hit_does_not_instantiate_backend_when_cuda_quarantined(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            audio = root / "audio.mp3"
+            audio.write_bytes(b"audio")
+            config = DiarizationConfig()
+            key = cache_key(audio, config, audio_preprocess="direct:false")
+            save_cached_segments(root / "cache", key, audio, config, [SpeakerSegment(0.0, 1.0, "SPEAKER_00")])
+            state = DiarizationRuntimeState(cuda_healthy=False, cuda_oom_quarantined=True)
+
+            with mock.patch("scripts.run_diarization.PyannoteDiarizationBackend") as backend:
+                segments, cache_hit = diarize_with_cache(
+                    audio,
+                    config,
+                    root / "cache",
+                    audio_preprocess="false",
+                    runtime_state=state,
+                )
+
+            self.assertTrue(cache_hit)
+            self.assertEqual(segments, [SpeakerSegment(0.0, 1.0, "SPEAKER_00")])
+            backend.assert_not_called()
+
+    def test_cpu_target_skips_tf32_configuration(self) -> None:
+        fake_torch = mock.Mock()
+        fake_torch.cuda.is_available.return_value = True
+        backend = PyannoteDiarizationBackend.__new__(PyannoteDiarizationBackend)
+        backend.verbose = True
+        backend.tf32_mode = "true"
+
+        backend.configure_tf32(fake_torch, "before inference", "cpu")
+
+        fake_torch.cuda.is_available.assert_not_called()
 
     def test_run_single_diarization_uses_preprocessed_audio_but_exports_original(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
