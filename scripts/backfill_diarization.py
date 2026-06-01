@@ -137,7 +137,7 @@ def build_state_output_jobs(
                                 existing_names,
                                 filename_policy,
                             ),
-                            "legacy_output_base": project_output_dir / transcript_path.relative_to(project_transcripts_dir).with_suffix(""),
+                            "legacy_output_base": project_output_dir / relative_to_transcripts_dir(transcript_path, project_transcripts_dir).with_suffix(""),
                         }
                     )
                     break
@@ -158,7 +158,7 @@ def build_state_output_jobs(
                                 existing_names,
                                 filename_policy,
                             ),
-                            "legacy_output_base": overall_output_dir / transcript_path.relative_to(overall_transcripts_dir).with_suffix(""),
+                            "legacy_output_base": overall_output_dir / relative_to_transcripts_dir(transcript_path, overall_transcripts_dir).with_suffix(""),
                         }
                     )
                     break
@@ -191,6 +191,13 @@ def strip_timestamp_suffix(stem: str) -> str:
     if marker not in stem:
         return stem
     return stem.split(marker, 1)[0]
+
+
+def relative_to_transcripts_dir(whisper_json: Path, transcripts_dir: Path) -> Path:
+    try:
+        return whisper_json.relative_to(transcripts_dir)
+    except ValueError:
+        return whisper_json.resolve().relative_to(transcripts_dir.resolve())
 
 
 def iter_whisper_json_files(transcripts_dir: Path) -> list[Path]:
@@ -242,7 +249,7 @@ def process_transcript_set(
             existing_safe_names,
             filename_policy,
         )
-        legacy_output_base = output_dir / whisper_json.relative_to(transcripts_dir).with_suffix("")
+        legacy_output_base = output_dir / relative_to_transcripts_dir(whisper_json, transcripts_dir).with_suffix("")
         key = manifest_key(whisper_json, output_base)
         audio_path = audio_lookup.get(str(whisper_json.resolve()))
         if audio_path is None:

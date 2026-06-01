@@ -21,7 +21,10 @@ def output_base_for_whisper_json(
     existing_safe_names: dict[Path, set[str]] | None = None,
     filename_policy: str = "auto",
 ) -> Path:
-    relative = whisper_json.relative_to(transcripts_dir)
+    try:
+        relative = whisper_json.relative_to(transcripts_dir)
+    except ValueError:
+        relative = whisper_json.resolve().relative_to(transcripts_dir.resolve())
     return output_dir / safe_relative_path(relative, existing_safe_names, filename_policy).with_suffix("")
 
 
