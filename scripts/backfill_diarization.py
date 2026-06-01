@@ -21,10 +21,17 @@ from diarization.pyannote_runner import (
     DiarizationOutOfMemoryError,
     PyannoteModelAccessError,
     PyannoteDiarizationBackend,
+    cleanup_runtime_memory,
     parse_oom_fallback,
     parse_tf32_mode,
 )
-from scripts.run_diarization import parse_bool, parse_optional_int, run_single_diarization
+from scripts.run_diarization import (
+    diarize_with_cache,
+    export_diarization_from_segments,
+    parse_bool,
+    parse_optional_int,
+    run_single_diarization,
+)
 
 
 SUPPORTED_AUDIO_EXTENSIONS = [
@@ -90,6 +97,74 @@ def build_audio_lookup(state_path: Path) -> dict[str, Path]:
                 for equivalent_path in equivalent_output_paths(output_path):
                     lookup[str(equivalent_path.resolve())] = audio_path
     return lookup
+
+
+def build_state_output_jobs(
+    state_path: Path,
+    project_transcripts_dir: Path,
+    project_output_dir: Path,
+    overall_transcripts_dir: Path,
+    overall_output_dir: Path,
+    filename_policy: str,
+) -> list[dict[str, Any]]:
+    state = load_json_if_exists(state_path)
+    jobs: list[dict[str, Any]] = []
+    existing_names_by_output: dict[Path, dict[Path, set[str]]] = {}
+    for record in state.get("files", {}).values():
+        if not isinstance(record, dict) or record.get("status") != "complete":
+            continue
+        input_dir = Path(str(record.get("input_dir", "")))
+        relative_path = str(record.get("relative_path", ""))
+        audio_path = input_dir / relative_path if input_dir and relative_path else None
+        if audio_path is None:
+            continue
+
+        targets: list[dict[str, Path]] = []
+        for output in record.get("project_outputs", []):
+            output_path = Path(str(output))
+            if output_path.suffix.lower() != ".json":
+                continue
+            for transcript_path in equivalent_output_paths(output_path):
+                if transcript_path.exists():
+                    existing_names = existing_names_by_output.setdefault(project_output_dir, {})
+                    targets.append(
+                        {
+                            "whisper_json": transcript_path,
+                            "output_base": output_base_for_whisper_json(
+                                transcript_path,
+                                project_transcripts_dir,
+                                project_output_dir,
+                                existing_names,
+                                filename_policy,
+                            ),
+                            "legacy_output_base": project_output_dir / transcript_path.relative_to(project_transcripts_dir).with_suffix(""),
+                        }
+                    )
+                    break
+        for output in record.get("overall_outputs", []):
+            output_path = Path(str(output))
+            if output_path.suffix.lower() != ".json":
+                continue
+            for transcript_path in equivalent_output_paths(output_path):
+                if transcript_path.exists():
+                    existing_names = existing_names_by_output.setdefault(overall_output_dir, {})
+                    targets.append(
+                        {
+                            "whisper_json": transcript_path,
+                            "output_base": output_base_for_whisper_json(
+                                transcript_path,
+                                overall_transcripts_dir,
+                                overall_output_dir,
+                                existing_names,
+                                filename_policy,
+                            ),
+                            "legacy_output_base": overall_output_dir / transcript_path.relative_to(overall_transcripts_dir).with_suffix(""),
+                        }
+                    )
+                    break
+        if targets:
+            jobs.append({"audio_path": audio_path, "targets": targets})
+    return jobs
 
 
 def discover_audio_from_audio_dir(whisper_json: Path, transcripts_dir: Path, audio_dir: Path | None) -> Path | None:
@@ -245,6 +320,134 @@ def process_transcript_set(
     return completed, skipped, missing_audio, failed
 
 
+def process_state_output_jobs(
+    jobs: list[dict[str, Any]],
+    manifest: dict[str, Any],
+    manifest_path: Path,
+    config: DiarizationConfig,
+    min_overlap_ratio: float,
+    cache_dir: Path,
+    force: bool,
+    dry_run: bool,
+    verbose: bool = False,
+    tf32_mode: str = "false",
+    progress: bool = False,
+    oom_fallback: str = "cpu",
+    filename_policy: str = "auto",
+) -> tuple[int, int, int, int]:
+    completed = 0
+    skipped = 0
+    missing_audio = 0
+    failed = 0
+    processable_jobs = [
+        job
+        for job in jobs
+        if Path(job["audio_path"]).exists()
+        and any(
+            force
+            or not (
+                speaker_outputs_complete(target["output_base"])
+                or speaker_outputs_complete(target["legacy_output_base"])
+            )
+            for target in job["targets"]
+        )
+    ]
+    processable_total = len(processable_jobs)
+    processable_index = 0
+
+    for job in jobs:
+        audio_path = Path(job["audio_path"])
+        targets = job["targets"]
+        print(f"Processing audio for paired diarization outputs: {audio_path}", flush=True)
+        if audio_path is None or not audio_path.exists():
+            missing_audio += 1
+            for target in targets:
+                key = manifest_key(target["whisper_json"], target["output_base"])
+                update_job(manifest, key, "skipped_missing_audio", target["whisper_json"], target["output_base"], audio_path)
+            save_manifest(manifest_path, manifest)
+            print(f"Skipped missing audio for: {audio_path}", flush=True)
+            continue
+
+        pending_targets = [
+            target
+            for target in targets
+            if force
+            or not (
+                speaker_outputs_complete(target["output_base"])
+                or speaker_outputs_complete(target["legacy_output_base"])
+            )
+        ]
+        if not pending_targets:
+            skipped += 1
+            for target in targets:
+                complete_output_base = target["output_base"] if speaker_outputs_complete(target["output_base"]) else target["legacy_output_base"]
+                key = manifest_key(target["whisper_json"], target["output_base"])
+                update_job(manifest, key, "skipped_existing", target["whisper_json"], complete_output_base, audio_path)
+            save_manifest(manifest_path, manifest)
+            print(f"Skipped existing paired outputs: {audio_path}", flush=True)
+            continue
+
+        processable_index += 1
+        if dry_run:
+            for target in pending_targets:
+                key = manifest_key(target["whisper_json"], target["output_base"])
+                update_job(manifest, key, "pending", target["whisper_json"], target["output_base"], audio_path)
+                print(f"Would process paired target: audio={audio_path} whisper={target['whisper_json']} output={target['output_base']}", flush=True)
+            save_manifest(manifest_path, manifest)
+            continue
+
+        try:
+            speaker_segments, cache_hit = diarize_with_cache(
+                audio_path,
+                config,
+                cache_dir,
+                force=force,
+                verbose=verbose,
+                tf32_mode=tf32_mode,
+                progress=progress,
+                progress_context=ProgressContext(file_index=processable_index, file_total=processable_total),
+                oom_fallback=oom_fallback,
+            )
+            combined_output_paths: dict[str, Path] = {}
+            for target_index, target in enumerate(pending_targets, start=1):
+                output_paths = export_diarization_from_segments(
+                    audio_path,
+                    target["whisper_json"],
+                    target["output_base"],
+                    config,
+                    min_overlap_ratio,
+                    speaker_segments,
+                    verbose=verbose,
+                    progress=progress,
+                    progress_context=ProgressContext(file_index=processable_index, file_total=processable_total),
+                    filename_policy=filename_policy,
+                )
+                for name, path in output_paths.items():
+                    combined_output_paths[f"target_{target_index}_{name}"] = path
+                key = manifest_key(target["whisper_json"], target["output_base"])
+                update_job(manifest, key, "completed", target["whisper_json"], target["output_base"], audio_path, output_paths, cache_hit=cache_hit)
+                print(f"Completed: {target['output_base']}", flush=True)
+            completed += 1
+            del speaker_segments
+            del combined_output_paths
+        except Exception as exc:
+            if isinstance(exc, DiarizationOutOfMemoryError) and oom_fallback == "fail":
+                raise
+            failed += 1
+            error_message = str(exc)
+            traceback_text = traceback.format_exc()
+            for target in pending_targets:
+                key = manifest_key(target["whisper_json"], target["output_base"])
+                update_job(manifest, key, "failed", target["whisper_json"], target["output_base"], audio_path, error_message=error_message)
+            print(f"Failed paired diarization for {audio_path}: {error_message}", file=sys.stderr, flush=True)
+            print(traceback_text, file=sys.stderr, flush=True)
+            del traceback_text
+        finally:
+            save_manifest(manifest_path, manifest)
+
+    return completed, skipped, missing_audio, failed
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Backfill speaker diarization for existing Whisper JSON outputs.")
     parser.add_argument("--transcripts-dir", type=Path, default=Path("output"))
@@ -275,62 +478,90 @@ def build_parser() -> argparse.ArgumentParser:
 
 def main() -> int:
     args = build_parser().parse_args()
-    if args.backend != "pyannote":
-        raise ValueError("Only the pyannote diarization backend is implemented.")
-    if not args.dry_run and not os.environ.get("PYANNOTE_AUTH_TOKEN"):
-        raise RuntimeError("PYANNOTE_AUTH_TOKEN is required unless --dry-run is used.")
+    try:
+        if args.backend != "pyannote":
+            raise ValueError("Only the pyannote diarization backend is implemented.")
+        if not args.dry_run and not os.environ.get("PYANNOTE_AUTH_TOKEN"):
+            raise RuntimeError("PYANNOTE_AUTH_TOKEN is required unless --dry-run is used.")
 
-    config = DiarizationConfig(args.backend, args.model, args.num_speakers, args.min_speakers, args.max_speakers)
-    print(
-        f"Diarization startup: model={config.model} verbose={args.verbose} "
-        f"progress={args.progress and not args.dry_run} tf32={args.tf32} "
-        f"oom_fallback={args.oom_fallback} filename_policy={args.safe_output_filenames} dry_run={args.dry_run}",
-        flush=True,
-    )
-    if not args.dry_run:
-        try:
-            PyannoteDiarizationBackend(config, tf32_mode=args.tf32, verbose=args.verbose).validate_access()
-        except PyannoteModelAccessError as exc:
-            print(f"Pyannote access check failed: {exc}", file=sys.stderr, flush=True)
-            return 2
+        config = DiarizationConfig(args.backend, args.model, args.num_speakers, args.min_speakers, args.max_speakers)
+        print(
+            f"Diarization startup: model={config.model} verbose={args.verbose} "
+            f"progress={args.progress and not args.dry_run} tf32={args.tf32} "
+            f"oom_fallback={args.oom_fallback} filename_policy={args.safe_output_filenames} dry_run={args.dry_run}",
+            flush=True,
+        )
+        if not args.dry_run:
+            try:
+                PyannoteDiarizationBackend(config, tf32_mode=args.tf32, verbose=args.verbose).validate_access()
+            except PyannoteModelAccessError as exc:
+                print(f"Pyannote access check failed: {exc}", file=sys.stderr, flush=True)
+                return 2
 
-    audio_lookup = build_audio_lookup(args.state_path)
-    manifest = load_manifest(args.manifest_path)
-
-    totals = [0, 0, 0, 0]
-    for transcripts_dir, output_dir in [
-        (args.transcripts_dir, args.output_dir),
-        (args.overall_transcripts_dir, args.overall_output_dir),
-    ]:
-        completed, skipped, missing_audio, failed = process_transcript_set(
-            transcripts_dir,
-            output_dir,
-            audio_lookup,
-            manifest,
-            args.manifest_path,
-            config,
-            args.min_overlap_ratio,
-            args.cache_dir,
-            args.audio_dir,
-            args.force,
-            args.dry_run,
-            args.verbose,
-            args.tf32,
-            args.progress and not args.dry_run,
-            args.oom_fallback,
+        manifest = load_manifest(args.manifest_path)
+        totals = [0, 0, 0, 0]
+        jobs = build_state_output_jobs(
+            args.state_path,
+            args.transcripts_dir,
+            args.output_dir,
+            args.overall_transcripts_dir,
+            args.overall_output_dir,
             args.safe_output_filenames,
         )
-        totals[0] += completed
-        totals[1] += skipped
-        totals[2] += missing_audio
-        totals[3] += failed
+        if jobs:
+            completed, skipped, missing_audio, failed = process_state_output_jobs(
+                jobs,
+                manifest,
+                args.manifest_path,
+                config,
+                args.min_overlap_ratio,
+                args.cache_dir,
+                args.force,
+                args.dry_run,
+                args.verbose,
+                args.tf32,
+                args.progress and not args.dry_run,
+                args.oom_fallback,
+                args.safe_output_filenames,
+            )
+            totals = [completed, skipped, missing_audio, failed]
+        else:
+            audio_lookup = build_audio_lookup(args.state_path)
+            for transcripts_dir, output_dir in [
+                (args.transcripts_dir, args.output_dir),
+                (args.overall_transcripts_dir, args.overall_output_dir),
+            ]:
+                completed, skipped, missing_audio, failed = process_transcript_set(
+                    transcripts_dir,
+                    output_dir,
+                    audio_lookup,
+                    manifest,
+                    args.manifest_path,
+                    config,
+                    args.min_overlap_ratio,
+                    args.cache_dir,
+                    args.audio_dir,
+                    args.force,
+                    args.dry_run,
+                    args.verbose,
+                    args.tf32,
+                    args.progress and not args.dry_run,
+                    args.oom_fallback,
+                    args.safe_output_filenames,
+                )
+                totals[0] += completed
+                totals[1] += skipped
+                totals[2] += missing_audio
+                totals[3] += failed
 
-    print(
-        f"Diarization done. Completed: {totals[0]}. Skipped existing: {totals[1]}. "
-        f"Skipped missing audio: {totals[2]}. Failed: {totals[3]}.",
-        flush=True,
-    )
-    return 1 if totals[3] else 0
+        print(
+            f"Diarization done. Completed: {totals[0]}. Skipped existing: {totals[1]}. "
+            f"Skipped missing audio: {totals[2]}. Failed: {totals[3]}.",
+            flush=True,
+        )
+        return 1 if totals[3] else 0
+    finally:
+        cleanup_runtime_memory(verbose=args.verbose, label="Final runtime cleanup before exit")
 
 
 if __name__ == "__main__":

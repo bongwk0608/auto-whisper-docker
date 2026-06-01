@@ -36,24 +36,36 @@ def is_cuda_oom_error(error: BaseException) -> bool:
     return "out of memory" in message or "unable to find an engine" in message
 
 
-def cleanup_cuda_memory(verbose: bool = False) -> None:
+def cleanup_runtime_memory(verbose: bool = False, label: str | None = None) -> None:
+    if verbose and label:
+        print(label, flush=True)
     gc.collect()
     try:
         import torch
     except ImportError:
         return
-    try:
-        if not torch.cuda.is_available():
-            return
-        torch.cuda.empty_cache()
-        ipc_collect = getattr(torch.cuda, "ipc_collect", None)
-        if callable(ipc_collect):
-            ipc_collect()
-        if verbose:
-            print("CUDA cleanup completed", flush=True)
-    except Exception as exc:
-        if verbose:
-            print(f"CUDA cleanup skipped after error: {exc}", flush=True)
+    if not torch.cuda.is_available():
+        gc.collect()
+        return
+    for operation_name, operation in [
+        ("synchronize", torch.cuda.synchronize),
+        ("empty_cache", torch.cuda.empty_cache),
+        ("ipc_collect", getattr(torch.cuda, "ipc_collect", None)),
+    ]:
+        if not callable(operation):
+            continue
+        try:
+            operation()
+        except Exception as exc:
+            if verbose:
+                print(f"CUDA cleanup {operation_name} skipped after error: {exc}", flush=True)
+    gc.collect()
+    if verbose:
+        print("Runtime cleanup completed", flush=True)
+
+
+def cleanup_cuda_memory(verbose: bool = False) -> None:
+    cleanup_runtime_memory(verbose=verbose)
 
 
 class PyannoteDiarizationBackend:
