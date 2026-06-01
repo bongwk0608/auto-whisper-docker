@@ -39,6 +39,7 @@ from diarization.pyannote_runner import (
 from diarization.raw_cache import cache_key, load_cached_segments, save_cached_segments
 from scripts.backfill_diarization import process_transcript_set
 from scripts.run_diarization import diarize_with_cache, run_pyannote_worker, run_single_diarization
+import scripts.pyannote_worker as pyannote_worker
 
 
 class DiarizationLogicTests(unittest.TestCase):
@@ -332,7 +333,10 @@ class DiarizationLogicTests(unittest.TestCase):
                 def kill(self):
                     self.returncode = -9
 
+            seen_command: list[str] = []
+
             def fake_popen(command, stdout, stderr, text, bufsize):
+                seen_command.extend(command)
                 out = Path(command[command.index("--cache-out") + 1])
                 out.write_text(
                     json.dumps(
@@ -349,6 +353,57 @@ class DiarizationLogicTests(unittest.TestCase):
                 segments = run_pyannote_worker(audio, DiarizationConfig(), "cuda", "false", False, False)
 
             self.assertEqual(segments, [SpeakerSegment(0.0, 1.0, "SPEAKER_00")])
+            self.assertNotIn("--progress", seen_command)
+
+    def test_run_pyannote_worker_passes_progress_flags_when_enabled(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            audio = root / "audio.wav"
+            audio.write_bytes(b"audio")
+            seen_command: list[str] = []
+
+            class FakeProcess:
+                stdout = iter(())
+                returncode = 0
+
+                def poll(self):
+                    return self.returncode
+
+                def wait(self, timeout=None):
+                    return self.returncode
+
+                def kill(self):
+                    self.returncode = -9
+
+            def fake_popen(command, stdout, stderr, text, bufsize):
+                seen_command.extend(command)
+                out = Path(command[command.index("--cache-out") + 1])
+                out.write_text(
+                    json.dumps(
+                        {
+                            "status": "completed",
+                            "speaker_segments": [{"start": 0.0, "end": 1.0, "speaker_label": "SPEAKER_00"}],
+                        }
+                    ),
+                    encoding="utf-8",
+                )
+                return FakeProcess()
+
+            with mock.patch("scripts.run_diarization.subprocess.Popen", side_effect=fake_popen):
+                run_pyannote_worker(
+                    audio,
+                    DiarizationConfig(),
+                    "cuda",
+                    "false",
+                    False,
+                    False,
+                    progress=True,
+                    progress_context=ProgressContext(file_index=3, file_total=9),
+                )
+
+            self.assertIn("--progress", seen_command)
+            self.assertEqual(seen_command[seen_command.index("--file-index") + 1], "3")
+            self.assertEqual(seen_command[seen_command.index("--file-total") + 1], "9")
 
     def test_run_pyannote_worker_timeout_records_string_error(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -691,7 +746,18 @@ class DiarizationLogicTests(unittest.TestCase):
             audio.write_bytes(b"audio")
             devices: list[str] = []
 
-            def fake_worker(audio_path, config, device, tf32_mode, verbose, gpu_memory_log, worker_timeout_seconds=7200, gpu_memory_wait_seconds=0):
+            def fake_worker(
+                audio_path,
+                config,
+                device,
+                tf32_mode,
+                verbose,
+                gpu_memory_log,
+                worker_timeout_seconds=7200,
+                gpu_memory_wait_seconds=0,
+                progress=False,
+                progress_context=None,
+            ):
                 devices.append(device)
                 return [SpeakerSegment(0.0, 1.0, "SPEAKER_00")]
 
@@ -714,9 +780,29 @@ class DiarizationLogicTests(unittest.TestCase):
             audio = root / "audio.mp3"
             audio.write_bytes(b"audio")
             devices: list[str] = []
+            progress_seen: list[tuple[str, bool, int | None, int | None]] = []
 
-            def fake_worker(audio_path, config, device, tf32_mode, verbose, gpu_memory_log, worker_timeout_seconds=7200, gpu_memory_wait_seconds=0):
+            def fake_worker(
+                audio_path,
+                config,
+                device,
+                tf32_mode,
+                verbose,
+                gpu_memory_log,
+                worker_timeout_seconds=7200,
+                gpu_memory_wait_seconds=0,
+                progress=False,
+                progress_context=None,
+            ):
                 devices.append(device)
+                progress_seen.append(
+                    (
+                        device,
+                        progress,
+                        progress_context.file_index if progress_context else None,
+                        progress_context.file_total if progress_context else None,
+                    )
+                )
                 if device == "cuda":
                     raise RuntimeError("CUDA error: out of memory")
                 return [SpeakerSegment(0.0, 1.0, "SPEAKER_00")]
@@ -729,10 +815,13 @@ class DiarizationLogicTests(unittest.TestCase):
                     audio_preprocess="false",
                     worker_mode="always",
                     oom_fallback="cpu",
+                    progress=True,
+                    progress_context=ProgressContext(file_index=2, file_total=5),
                 )
 
             self.assertFalse(cache_hit)
             self.assertEqual(devices, ["cuda", "cpu"])
+            self.assertEqual(progress_seen, [("cuda", True, 2, 5), ("cpu", True, 2, 5)])
             self.assertEqual(segments, [SpeakerSegment(0.0, 1.0, "SPEAKER_00")])
 
     def test_on_oom_worker_mode_uses_worker_for_next_cuda_attempt(self) -> None:
@@ -756,7 +845,18 @@ class DiarizationLogicTests(unittest.TestCase):
                         raise RuntimeError("CUDA error: out of memory")
                     return [SpeakerSegment(0.0, 1.0, "SPEAKER_00")]
 
-            def fake_worker(audio_path, config, device, tf32_mode, verbose, gpu_memory_log, worker_timeout_seconds=7200, gpu_memory_wait_seconds=0):
+            def fake_worker(
+                audio_path,
+                config,
+                device,
+                tf32_mode,
+                verbose,
+                gpu_memory_log,
+                worker_timeout_seconds=7200,
+                gpu_memory_wait_seconds=0,
+                progress=False,
+                progress_context=None,
+            ):
                 worker_devices.append(device)
                 return [SpeakerSegment(0.0, 1.0, "SPEAKER_01")]
 
@@ -796,6 +896,81 @@ class DiarizationLogicTests(unittest.TestCase):
         backend.configure_tf32(fake_torch, "before inference", "cpu")
 
         fake_torch.cuda.is_available.assert_not_called()
+
+    def test_pyannote_worker_passes_progress_reporter_to_backend(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            audio = root / "audio.wav"
+            cache_out = root / "segments.json"
+            audio.write_bytes(b"audio")
+            reporters: list[object] = []
+
+            class FakeBackend:
+                def __init__(self, config, device=None, tf32_mode=None, verbose=False):
+                    pass
+
+                def diarize(self, audio_path, progress_reporter=None):
+                    reporters.append(progress_reporter)
+                    return [SpeakerSegment(0.0, 1.0, "SPEAKER_00")]
+
+            argv = [
+                "pyannote_worker.py",
+                "--audio",
+                str(audio),
+                "--cache-out",
+                str(cache_out),
+                "--device",
+                "cpu",
+                "--progress",
+                "--file-index",
+                "4",
+                "--file-total",
+                "8",
+            ]
+            with (
+                mock.patch.object(pyannote_worker.sys, "argv", argv),
+                mock.patch.object(pyannote_worker, "PyannoteDiarizationBackend", FakeBackend),
+            ):
+                exit_code = pyannote_worker.main()
+
+            self.assertEqual(exit_code, 0)
+            self.assertIsNotNone(reporters[0])
+            self.assertEqual(reporters[0].context.file_index, 4)
+            self.assertEqual(reporters[0].context.file_total, 8)
+
+    def test_pyannote_worker_omits_progress_reporter_when_disabled(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            audio = root / "audio.wav"
+            cache_out = root / "segments.json"
+            audio.write_bytes(b"audio")
+            reporters: list[object] = []
+
+            class FakeBackend:
+                def __init__(self, config, device=None, tf32_mode=None, verbose=False):
+                    pass
+
+                def diarize(self, audio_path, progress_reporter=None):
+                    reporters.append(progress_reporter)
+                    return [SpeakerSegment(0.0, 1.0, "SPEAKER_00")]
+
+            argv = [
+                "pyannote_worker.py",
+                "--audio",
+                str(audio),
+                "--cache-out",
+                str(cache_out),
+                "--device",
+                "cpu",
+            ]
+            with (
+                mock.patch.object(pyannote_worker.sys, "argv", argv),
+                mock.patch.object(pyannote_worker, "PyannoteDiarizationBackend", FakeBackend),
+            ):
+                exit_code = pyannote_worker.main()
+
+            self.assertEqual(exit_code, 0)
+            self.assertIsNone(reporters[0])
 
     def test_run_single_diarization_uses_preprocessed_audio_but_exports_original(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:

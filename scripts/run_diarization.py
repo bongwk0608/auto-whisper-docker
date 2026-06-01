@@ -138,6 +138,8 @@ def run_pyannote_worker(
     gpu_memory_log: bool,
     worker_timeout_seconds: int | None = None,
     gpu_memory_wait_seconds: int | None = None,
+    progress: bool = False,
+    progress_context: ProgressContext | None = None,
 ) -> list[SpeakerSegment]:
     timeout_seconds = (
         parse_worker_timeout_seconds(os.environ.get("DIARIZATION_WORKER_TIMEOUT_SECONDS"))
@@ -173,6 +175,17 @@ def run_pyannote_worker(
             command.extend(["--min-speakers", str(config.min_speakers)])
         if config.max_speakers is not None:
             command.extend(["--max-speakers", str(config.max_speakers)])
+        if progress:
+            context = progress_context or ProgressContext()
+            command.extend(
+                [
+                    "--progress",
+                    "--file-index",
+                    str(context.file_index),
+                    "--file-total",
+                    str(context.file_total),
+                ]
+            )
         if verbose:
             command.append("--verbose")
             print(f"Starting Pyannote worker: device={device} timeout={timeout_seconds}s", flush=True)
@@ -409,6 +422,8 @@ def diarize_with_cache(
                     gpu_memory_log,
                     worker_timeout_seconds,
                     gpu_memory_wait_seconds,
+                    progress,
+                    progress_context,
                 )
                 cleanup_runtime_memory(verbose=verbose, label="Runtime cleanup after worker")
             else:
@@ -441,6 +456,8 @@ def diarize_with_cache(
                     gpu_memory_log,
                     worker_timeout_seconds,
                     gpu_memory_wait_seconds,
+                    progress,
+                    progress_context,
                 )
                 cleanup_runtime_memory(verbose=verbose, label="Runtime cleanup after CPU worker fallback")
             else:

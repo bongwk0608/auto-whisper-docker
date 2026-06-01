@@ -11,6 +11,7 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from diarization.backend import DiarizationConfig
+from diarization.progress import DiarizationProgressReporter, ProgressContext
 from diarization.pyannote_runner import PyannoteDiarizationBackend, is_cuda_oom_error, parse_tf32_mode
 
 
@@ -36,6 +37,9 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--min-speakers", type=int, default=None)
     parser.add_argument("--max-speakers", type=int, default=None)
     parser.add_argument("--tf32", choices=["auto", "true", "false"], default=parse_tf32_mode(None))
+    parser.add_argument("--progress", action="store_true")
+    parser.add_argument("--file-index", type=int, default=1)
+    parser.add_argument("--file-total", type=int, default=1)
     parser.add_argument("--verbose", action="store_true")
     return parser
 
@@ -56,8 +60,13 @@ def main() -> int:
             tf32_mode=args.tf32,
             verbose=args.verbose,
         )
+        progress_reporter = (
+            DiarizationProgressReporter(ProgressContext(file_index=args.file_index, file_total=args.file_total))
+            if args.progress
+            else None
+        )
         try:
-            segments = backend.diarize(args.audio)
+            segments = backend.diarize(args.audio, progress_reporter=progress_reporter)
         finally:
             del backend
         write_payload(
