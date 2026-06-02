@@ -599,7 +599,7 @@ After editing `input-folders.txt`, rerun the setup helper so `docker-compose.ove
 docker compose --profile pipeline config
 ```
 
-The setup helper preserves existing diarization settings in `.env`; if `PYANNOTE_AUTH_TOKEN` is blank, add it before running `pipeline-cuda`. Be careful when sharing `docker compose config` output because it can include Hugging Face tokens; rotate exposed tokens.
+The setup helper preserves existing diarization settings in `.env`; if `PYANNOTE_AUTH_TOKEN` is blank, add it before running `pipeline-cuda`. The pipeline checks for this token before starting Whisper so a missing diarization token fails immediately instead of after transcription. Be careful when sharing `docker compose config` output because it can include Hugging Face tokens; rotate exposed tokens.
 
 For the host-side helper script, on Windows PowerShell:
 

@@ -71,6 +71,7 @@ class SetupGeneratorTests(unittest.TestCase):
             assert_pipeline_override_mounts(self, override_text)
             self.assertIn("SOURCE_DIRS", env_values)
             self.assertEqual(env_values["PYANNOTE_AUTH_TOKEN"], "")
+            self.assertEqual(env_values["SAFE_OUTPUT_FILENAMES"], "auto")
             self.assertEqual(env_values["DIARIZATION_BACKEND"], "pyannote")
             self.assertEqual(env_values["DIARIZATION_MODEL"], "pyannote/speaker-diarization-community-1")
             self.assertEqual(env_values["DIARIZATION_WORKER_MODE"], "always")
@@ -94,6 +95,11 @@ class SetupGeneratorTests(unittest.TestCase):
                         "SOURCE_DIRS=/old/source",
                         "OUTPUT_DIRS=/old/output",
                         "INPUT_OUTPUT_PAIRS=[]",
+                        "WHISPER_LANGUAGE=en",
+                        "LOCAL_STAGING=true",
+                        "LOCAL_STAGING_DIR=/tmp/custom-staging",
+                        "SAFE_OUTPUT_FILENAMES=false",
+                        "SUPPORTED_EXTENSIONS=.mp3,.wav",
                         "PYANNOTE_AUTH_TOKEN=hf_test_token",
                         "PYANNOTE_METRICS_ENABLED=1",
                         "DIARIZATION_VERBOSE=true",
@@ -130,6 +136,11 @@ class SetupGeneratorTests(unittest.TestCase):
             env_values = parse_env(temp_root / ".env")
             self.assertNotEqual(env_values["SOURCE_DIRS"], "/old/source")
             self.assertEqual(env_values["WHISPER_MODEL"], "small")
+            self.assertEqual(env_values["WHISPER_LANGUAGE"], "en")
+            self.assertEqual(env_values["LOCAL_STAGING"], "true")
+            self.assertEqual(env_values["LOCAL_STAGING_DIR"], "/tmp/custom-staging")
+            self.assertEqual(env_values["SAFE_OUTPUT_FILENAMES"], "false")
+            self.assertEqual(env_values["SUPPORTED_EXTENSIONS"], ".mp3,.wav")
             self.assertEqual(env_values["PYANNOTE_AUTH_TOKEN"], "hf_test_token")
             self.assertEqual(env_values["PYANNOTE_METRICS_ENABLED"], "1")
             self.assertEqual(env_values["DIARIZATION_VERBOSE"], "true")
@@ -167,6 +178,7 @@ class SetupGeneratorTests(unittest.TestCase):
             env_values = parse_env(temp_root / ".env")
             assert_pipeline_override_mounts(self, override_text)
             self.assertEqual(env_values["PYANNOTE_AUTH_TOKEN"], "")
+            self.assertEqual(env_values["SAFE_OUTPUT_FILENAMES"], "auto")
             self.assertEqual(env_values["DIARIZATION_BACKEND"], "pyannote")
             self.assertEqual(env_values["DIARIZATION_MODEL"], "pyannote/speaker-diarization-community-1")
             self.assertEqual(env_values["DIARIZATION_WORKER_MODE"], "always")
@@ -190,6 +202,11 @@ class SetupGeneratorTests(unittest.TestCase):
                         "SOURCE_DIRS=/old/source",
                         "OUTPUT_DIRS=/old/output",
                         "INPUT_OUTPUT_PAIRS=[]",
+                        "WHISPER_LANGUAGE=en",
+                        "LOCAL_STAGING=true",
+                        "LOCAL_STAGING_DIR=/tmp/custom-staging",
+                        "SAFE_OUTPUT_FILENAMES=false",
+                        "SUPPORTED_EXTENSIONS=.mp3,.wav",
                         "PYANNOTE_AUTH_TOKEN=hf_test_token",
                         "PYANNOTE_METRICS_ENABLED=1",
                         "DIARIZATION_VERBOSE=true",
@@ -222,6 +239,11 @@ class SetupGeneratorTests(unittest.TestCase):
             env_values = parse_env(temp_root / ".env")
             self.assertNotEqual(env_values["SOURCE_DIRS"], "/old/source")
             self.assertEqual(env_values["WHISPER_MODEL"], "small")
+            self.assertEqual(env_values["WHISPER_LANGUAGE"], "en")
+            self.assertEqual(env_values["LOCAL_STAGING"], "true")
+            self.assertEqual(env_values["LOCAL_STAGING_DIR"], "/tmp/custom-staging")
+            self.assertEqual(env_values["SAFE_OUTPUT_FILENAMES"], "false")
+            self.assertEqual(env_values["SUPPORTED_EXTENSIONS"], ".mp3,.wav")
             self.assertEqual(env_values["PYANNOTE_AUTH_TOKEN"], "hf_test_token")
             self.assertEqual(env_values["PYANNOTE_METRICS_ENABLED"], "1")
             self.assertEqual(env_values["DIARIZATION_VERBOSE"], "true")
