@@ -1,6 +1,8 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+export PYTHONPATH="/app${PYTHONPATH:+:${PYTHONPATH}}"
+
 echo "==> Starting Whisper CUDA transcription"
 python /app/scripts/transcribe.py
 
