@@ -273,6 +273,24 @@ EOF
     echo "        target: /outputs/output-$(printf '%03d' "$INDEX")"
     INDEX=$((INDEX + 1))
   done
+  echo "  pipeline-cuda:"
+  echo "    volumes:"
+  INDEX=1
+  while [ "$INDEX" -le "$SOURCE_COUNT" ]; do
+    SOURCE_DIR="$(value_at "$INDEX" "$RESOLVED_SOURCE_DIRS")"
+    echo "      - type: bind"
+    echo "        source: $(yaml_quote "$SOURCE_DIR")"
+    echo "        target: /inputs/input-$(printf '%03d' "$INDEX")"
+    INDEX=$((INDEX + 1))
+  done
+  INDEX=1
+  while [ "$INDEX" -le "$OUTPUT_COUNT" ]; do
+    OUTPUT_DIR="$(value_at "$INDEX" "$RESOLVED_OUTPUT_DIRS")"
+    echo "      - type: bind"
+    echo "        source: $(yaml_quote "$OUTPUT_DIR")"
+    echo "        target: /outputs/output-$(printf '%03d' "$INDEX")"
+    INDEX=$((INDEX + 1))
+  done
 } > "$OVERRIDE_PATH"
 
 echo "Wrote $ENV_PATH"

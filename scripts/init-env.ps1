@@ -216,6 +216,9 @@ $($VolumeLines -join "`n")
   whisper-cuda:
     volumes:
 $($VolumeLines -join "`n")
+  pipeline-cuda:
+    volumes:
+$($VolumeLines -join "`n")
 "@ | Set-Content -LiteralPath $OverridePath -Encoding UTF8
 
 Write-Host "Wrote $EnvPath"

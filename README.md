@@ -590,6 +590,12 @@ docker compose --profile pipeline up --build pipeline-cuda
 
 This runs Whisper first, then starts diarization only if Whisper succeeds. The pipeline exits with a non-zero status if either stage fails.
 
+After editing `input-folders.txt`, rerun the setup helper so `docker-compose.override.yml` includes the matching `pipeline-cuda` input and output bind mounts. Validate the pipeline profile before launching:
+
+```sh
+docker compose --profile pipeline config
+```
+
 For the host-side helper script, on Windows PowerShell:
 
 ```powershell
