@@ -5,7 +5,7 @@ import json
 import os
 import sys
 import traceback
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import Any
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -71,12 +71,38 @@ SUPPORTED_AUDIO_EXTENSIONS = [
 
 def equivalent_output_paths(path: Path) -> list[Path]:
     paths = [path]
-    parts = path.parts
+    parts = PurePosixPath(path.as_posix()).parts
     if len(parts) >= 4 and parts[0] == "/" and parts[1] == "outputs" and parts[2].startswith("output-"):
         paths.append(ROOT / "output" / Path(*parts[3:]))
     elif len(parts) >= 3 and parts[0] == "/" and parts[1] == "overall-output":
         paths.append(ROOT / "output_overall" / Path(*parts[2:]))
     return paths
+
+
+def relative_to_or_none(path: Path, root: Path) -> Path | None:
+    try:
+        return path.relative_to(root)
+    except ValueError:
+        try:
+            return path.resolve().relative_to(root.resolve())
+        except ValueError:
+            return None
+
+
+def select_existing_transcript_path(output_path: Path, transcripts_dir: Path) -> Path | None:
+    existing_paths = [path for path in equivalent_output_paths(output_path) if path.exists()]
+    if not existing_paths:
+        return None
+    for path in existing_paths:
+        if relative_to_or_none(path, transcripts_dir) is not None:
+            return path
+    print(
+        f"Skipping transcript outside configured transcripts dir: {output_path} "
+        f"(expected under {transcripts_dir})",
+        file=sys.stderr,
+        flush=True,
+    )
+    return None
 
 
 def load_json_if_exists(path: Path) -> dict[str, Any]:
@@ -131,44 +157,42 @@ def build_state_output_jobs(
             output_path = Path(str(output))
             if output_path.suffix.lower() != ".json":
                 continue
-            for transcript_path in equivalent_output_paths(output_path):
-                if transcript_path.exists():
-                    existing_names = existing_names_by_output.setdefault(project_output_dir, {})
-                    targets.append(
-                        {
-                            "whisper_json": transcript_path,
-                            "output_base": output_base_for_whisper_json(
-                                transcript_path,
-                                project_transcripts_dir,
-                                project_output_dir,
-                                existing_names,
-                                filename_policy,
-                            ),
-                            "legacy_output_base": project_output_dir / relative_to_transcripts_dir(transcript_path, project_transcripts_dir).with_suffix(""),
-                        }
-                    )
-                    break
+            transcript_path = select_existing_transcript_path(output_path, project_transcripts_dir)
+            if transcript_path is not None:
+                existing_names = existing_names_by_output.setdefault(project_output_dir, {})
+                targets.append(
+                    {
+                        "whisper_json": transcript_path,
+                        "output_base": output_base_for_whisper_json(
+                            transcript_path,
+                            project_transcripts_dir,
+                            project_output_dir,
+                            existing_names,
+                            filename_policy,
+                        ),
+                        "legacy_output_base": project_output_dir / relative_to_transcripts_dir(transcript_path, project_transcripts_dir).with_suffix(""),
+                    }
+                )
         for output in record.get("overall_outputs", []):
             output_path = Path(str(output))
             if output_path.suffix.lower() != ".json":
                 continue
-            for transcript_path in equivalent_output_paths(output_path):
-                if transcript_path.exists():
-                    existing_names = existing_names_by_output.setdefault(overall_output_dir, {})
-                    targets.append(
-                        {
-                            "whisper_json": transcript_path,
-                            "output_base": output_base_for_whisper_json(
-                                transcript_path,
-                                overall_transcripts_dir,
-                                overall_output_dir,
-                                existing_names,
-                                filename_policy,
-                            ),
-                            "legacy_output_base": overall_output_dir / relative_to_transcripts_dir(transcript_path, overall_transcripts_dir).with_suffix(""),
-                        }
-                    )
-                    break
+            transcript_path = select_existing_transcript_path(output_path, overall_transcripts_dir)
+            if transcript_path is not None:
+                existing_names = existing_names_by_output.setdefault(overall_output_dir, {})
+                targets.append(
+                    {
+                        "whisper_json": transcript_path,
+                        "output_base": output_base_for_whisper_json(
+                            transcript_path,
+                            overall_transcripts_dir,
+                            overall_output_dir,
+                            existing_names,
+                            filename_policy,
+                        ),
+                        "legacy_output_base": overall_output_dir / relative_to_transcripts_dir(transcript_path, overall_transcripts_dir).with_suffix(""),
+                    }
+                )
         if targets:
             jobs.append({"audio_path": audio_path, "targets": targets})
     return jobs

@@ -37,7 +37,8 @@ from diarization.pyannote_runner import (
     prepare_next_file_cuda_attempt,
 )
 from diarization.raw_cache import cache_key, load_cached_segments, save_cached_segments
-from scripts.backfill_diarization import process_transcript_set
+import scripts.backfill_diarization as backfill_diarization
+from scripts.backfill_diarization import build_state_output_jobs, process_transcript_set
 from scripts.run_diarization import diarize_with_cache, run_pyannote_worker, run_single_diarization
 import scripts.pyannote_worker as pyannote_worker
 
@@ -261,6 +262,50 @@ class DiarizationLogicTests(unittest.TestCase):
         )
 
         self.assertEqual(base.as_posix(), "/tmp/output_pyannote/run/course week/audio file")
+
+    def test_state_jobs_normalize_outputs_mount_to_project_transcripts_dir(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            transcripts = root / "output"
+            output = root / "output_pyannote"
+            transcript = transcripts / "run-001" / "course" / "audio.json"
+            transcript.parent.mkdir(parents=True)
+            transcript.write_text(json.dumps({"segments": []}), encoding="utf-8")
+
+            state_path = root / "state" / "progress.json"
+            state_path.parent.mkdir()
+            state_path.write_text(
+                json.dumps(
+                    {
+                        "files": {
+                            "pair-001:course/audio.mp3": {
+                                "status": "complete",
+                                "input_dir": "/inputs/input-001",
+                                "relative_path": "course/audio.mp3",
+                                "project_outputs": [
+                                    "/outputs/output-001/run-001/course/audio.json",
+                                ],
+                                "overall_outputs": [],
+                            }
+                        }
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            with mock.patch.object(backfill_diarization, "ROOT", root):
+                jobs = build_state_output_jobs(
+                    state_path,
+                    transcripts,
+                    output,
+                    root / "output_overall",
+                    root / "output_pyannote_overall",
+                    "auto",
+                )
+
+            self.assertEqual(len(jobs), 1)
+            self.assertEqual(jobs[0]["targets"][0]["whisper_json"], transcript)
+            self.assertEqual(jobs[0]["targets"][0]["output_base"], output / "run-001" / "course" / "audio")
 
     def test_progress_duration_formats_unknown_and_clock_time(self) -> None:
         self.assertEqual(format_duration(None), "unknown")
