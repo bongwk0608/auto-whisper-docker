@@ -585,6 +585,14 @@ Do not keep Whisper and pyannote running on the GPU at the same time. To check W
 You can also run the sequential pipeline with one command. On Windows PowerShell:
 
 ```powershell
+docker compose --profile pipeline up --build pipeline-cuda
+```
+
+This runs Whisper first, then starts diarization only if Whisper succeeds. The pipeline exits with a non-zero status if either stage fails.
+
+For the host-side helper script, on Windows PowerShell:
+
+```powershell
 .\scripts\run_pipeline.ps1 -Cuda -Diarization
 ```
 

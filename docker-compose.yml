@@ -31,6 +31,34 @@ x-whisper-environment: &whisper-environment
   SAFE_OUTPUT_FILENAMES: ${SAFE_OUTPUT_FILENAMES:-auto}
   SUPPORTED_EXTENSIONS: ${SUPPORTED_EXTENSIONS:-.mp3,.wav,.m4a,.flac,.ogg,.aac,.wma,.mp4,.m4v,.mov,.mkv,.webm,.avi,.wmv,.flv,.ts,.mts,.m2ts,.3gp,.3g2,.mpg,.mpeg,.vob,.ogv}
 
+x-diarization-environment: &diarization-environment
+  PYANNOTE_AUTH_TOKEN: ${PYANNOTE_AUTH_TOKEN:-}
+  PYANNOTE_METRICS_ENABLED: ${PYANNOTE_METRICS_ENABLED:-0}
+  DIARIZATION_BACKEND: ${DIARIZATION_BACKEND:-pyannote}
+  DIARIZATION_MODEL: ${DIARIZATION_MODEL:-pyannote/speaker-diarization-community-1}
+  DIARIZATION_VERBOSE: ${DIARIZATION_VERBOSE:-false}
+  DIARIZATION_PROGRESS: ${DIARIZATION_PROGRESS:-}
+  DIARIZATION_TF32: ${DIARIZATION_TF32:-false}
+  DIARIZATION_OOM_FALLBACK: ${DIARIZATION_OOM_FALLBACK:-cpu}
+  DIARIZATION_CUDA_QUARANTINE_AFTER_OOM: ${DIARIZATION_CUDA_QUARANTINE_AFTER_OOM:-false}
+  DIARIZATION_CUDA_DEBUG_ERRORS: ${DIARIZATION_CUDA_DEBUG_ERRORS:-false}
+  DIARIZATION_WORKER_MODE: ${DIARIZATION_WORKER_MODE:-always}
+  DIARIZATION_GPU_MEMORY_LOG: ${DIARIZATION_GPU_MEMORY_LOG:-false}
+  DIARIZATION_WORKER_TIMEOUT_SECONDS: ${DIARIZATION_WORKER_TIMEOUT_SECONDS:-7200}
+  DIARIZATION_GPU_MEMORY_WAIT_SECONDS: ${DIARIZATION_GPU_MEMORY_WAIT_SECONDS:-0}
+  DIARIZATION_AUDIO_PREPROCESS: ${DIARIZATION_AUDIO_PREPROCESS:-always}
+  DIARIZATION_AUDIO_PREPROCESS_DIR: ${DIARIZATION_AUDIO_PREPROCESS_DIR:-/tmp/auto-whisper-diarization}
+  SAFE_OUTPUT_FILENAMES: ${SAFE_OUTPUT_FILENAMES:-auto}
+  DIARIZATION_MIN_OVERLAP_RATIO: ${DIARIZATION_MIN_OVERLAP_RATIO:-0.3}
+  DIARIZATION_NUM_SPEAKERS: ${DIARIZATION_NUM_SPEAKERS:-}
+  DIARIZATION_MIN_SPEAKERS: ${DIARIZATION_MIN_SPEAKERS:-}
+  DIARIZATION_MAX_SPEAKERS: ${DIARIZATION_MAX_SPEAKERS:-}
+  DIARIZATION_CACHE_DIR: ${DIARIZATION_CACHE_DIR:-/app/state/diarization-cache}
+  HF_HOME: ${HF_HOME:-/cache/huggingface}
+  TORCH_HOME: ${TORCH_HOME:-/cache/torch}
+  NVIDIA_VISIBLE_DEVICES: ${NVIDIA_VISIBLE_DEVICES:-all}
+  NVIDIA_DRIVER_CAPABILITIES: ${NVIDIA_DRIVER_CAPABILITIES:-compute,utility}
+
 services:
   whisper:
     build:
@@ -78,32 +106,7 @@ services:
         source: ./.cache/torch
         target: /cache/torch
     environment:
-      PYANNOTE_AUTH_TOKEN: ${PYANNOTE_AUTH_TOKEN:-}
-      PYANNOTE_METRICS_ENABLED: ${PYANNOTE_METRICS_ENABLED:-0}
-      DIARIZATION_BACKEND: ${DIARIZATION_BACKEND:-pyannote}
-      DIARIZATION_MODEL: ${DIARIZATION_MODEL:-pyannote/speaker-diarization-community-1}
-      DIARIZATION_VERBOSE: ${DIARIZATION_VERBOSE:-false}
-      DIARIZATION_PROGRESS: ${DIARIZATION_PROGRESS:-}
-      DIARIZATION_TF32: ${DIARIZATION_TF32:-false}
-      DIARIZATION_OOM_FALLBACK: ${DIARIZATION_OOM_FALLBACK:-cpu}
-      DIARIZATION_CUDA_QUARANTINE_AFTER_OOM: ${DIARIZATION_CUDA_QUARANTINE_AFTER_OOM:-false}
-      DIARIZATION_CUDA_DEBUG_ERRORS: ${DIARIZATION_CUDA_DEBUG_ERRORS:-false}
-      DIARIZATION_WORKER_MODE: ${DIARIZATION_WORKER_MODE:-always}
-      DIARIZATION_GPU_MEMORY_LOG: ${DIARIZATION_GPU_MEMORY_LOG:-false}
-      DIARIZATION_WORKER_TIMEOUT_SECONDS: ${DIARIZATION_WORKER_TIMEOUT_SECONDS:-7200}
-      DIARIZATION_GPU_MEMORY_WAIT_SECONDS: ${DIARIZATION_GPU_MEMORY_WAIT_SECONDS:-0}
-      DIARIZATION_AUDIO_PREPROCESS: ${DIARIZATION_AUDIO_PREPROCESS:-always}
-      DIARIZATION_AUDIO_PREPROCESS_DIR: ${DIARIZATION_AUDIO_PREPROCESS_DIR:-/tmp/auto-whisper-diarization}
-      SAFE_OUTPUT_FILENAMES: ${SAFE_OUTPUT_FILENAMES:-auto}
-      DIARIZATION_MIN_OVERLAP_RATIO: ${DIARIZATION_MIN_OVERLAP_RATIO:-0.3}
-      DIARIZATION_NUM_SPEAKERS: ${DIARIZATION_NUM_SPEAKERS:-}
-      DIARIZATION_MIN_SPEAKERS: ${DIARIZATION_MIN_SPEAKERS:-}
-      DIARIZATION_MAX_SPEAKERS: ${DIARIZATION_MAX_SPEAKERS:-}
-      DIARIZATION_CACHE_DIR: ${DIARIZATION_CACHE_DIR:-/app/state/diarization-cache}
-      HF_HOME: ${HF_HOME:-/cache/huggingface}
-      TORCH_HOME: ${TORCH_HOME:-/cache/torch}
-      NVIDIA_VISIBLE_DEVICES: ${NVIDIA_VISIBLE_DEVICES:-all}
-      NVIDIA_DRIVER_CAPABILITIES: ${NVIDIA_DRIVER_CAPABILITIES:-compute,utility}
+      <<: *diarization-environment
     working_dir: /app
     command: >
       python scripts/backfill_diarization.py
@@ -141,3 +144,58 @@ services:
               capabilities: [gpu]
     stdin_open: true
     tty: true
+
+  pipeline-cuda:
+    profiles: ["pipeline"]
+    build:
+      context: .
+      dockerfile: Dockerfile.pipeline
+    image: auto-whisper:pipeline-cuda
+    gpus: all
+    volumes:
+      - type: bind
+        source: .
+        target: /app
+      - type: bind
+        source: ./state
+        target: /state
+      - type: bind
+        source: ./state
+        target: /app/state
+      - type: bind
+        source: ./models
+        target: /root/.cache/whisper
+      - type: bind
+        source: ./output
+        target: /app/output
+      - type: bind
+        source: ./output_overall
+        target: /overall-output
+      - type: bind
+        source: ./output_overall
+        target: /app/output_overall
+      - type: bind
+        source: ./output_pyannote
+        target: /app/output_pyannote
+      - type: bind
+        source: ./output_pyannote_overall
+        target: /app/output_pyannote_overall
+      - type: bind
+        source: ./.cache/huggingface
+        target: /cache/huggingface
+      - type: bind
+        source: ./.cache/torch
+        target: /cache/torch
+    environment:
+      <<: [*whisper-environment, *diarization-environment]
+      WHISPER_DEVICE: ${WHISPER_DEVICE:-auto}
+      WHISPER_FP16: ${WHISPER_FP16:-auto}
+    working_dir: /app
+    command: ["bash", "/app/scripts/pipeline-cuda.sh"]
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
