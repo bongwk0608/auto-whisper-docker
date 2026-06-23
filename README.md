@@ -46,6 +46,7 @@ sh ./scripts/init-env.sh --source-list-file ./input-folders.txt
 ```
 
 The helper writes both `.env` and `docker-compose.override.yml`. The override file contains local folder bind mounts and is ignored by Git.
+When rerun, the helper regenerates source/output and Whisper settings while preserving existing diarization settings such as `PYANNOTE_AUTH_TOKEN`, `DIARIZATION_*`, `HF_HOME`, and `TORCH_HOME`.
 
 ## Windows Network Drive Auto-Mount
 
@@ -484,6 +485,8 @@ SAFE_OUTPUT_FILENAMES=auto
 PYANNOTE_METRICS_ENABLED=0
 ```
 
+First-time diarization and pipeline users must add `PYANNOTE_AUTH_TOKEN` to `.env`. The setup helper preserves this token on later reruns, but leaves it blank if it was never configured.
+
 `DIARIZATION_TF32` controls PyTorch TensorFloat-32 behavior for pyannote on CUDA:
 
 - `false` disables TF32 and is the default because pyannote does this for more reproducible speaker labels.
@@ -595,6 +598,8 @@ After editing `input-folders.txt`, rerun the setup helper so `docker-compose.ove
 ```sh
 docker compose --profile pipeline config
 ```
+
+The setup helper preserves existing diarization settings in `.env`; if `PYANNOTE_AUTH_TOKEN` is blank, add it before running `pipeline-cuda`. The pipeline checks for this token before starting Whisper so a missing diarization token fails immediately instead of after transcription. Be careful when sharing `docker compose config` output because it can include Hugging Face tokens; rotate exposed tokens.
 
 For the host-side helper script, on Windows PowerShell:
 
