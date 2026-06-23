@@ -10,6 +10,9 @@ x-whisper-volumes: &whisper-volumes
     target: /overall-output
 
 x-whisper-environment: &whisper-environment
+  LANG: C.UTF-8
+  LC_ALL: C.UTF-8
+  PYTHONIOENCODING: utf-8
   SOURCE_DIRS: ${SOURCE_DIRS:-}
   OUTPUT_DIRS: ${OUTPUT_DIRS:-}
   INPUT_OUTPUT_PAIRS: ${INPUT_OUTPUT_PAIRS:-}
