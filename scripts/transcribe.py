@@ -1,10 +1,13 @@
 from __future__ import annotations
 
 import csv
+import gc
 import hashlib
 import json
+import multiprocessing
 import os
 import shutil
+import subprocess
 import sys
 import tempfile
 import traceback
@@ -52,6 +55,10 @@ class PreparedPair(NamedTuple):
     mapping: dict[str, Any] | None
 
 
+class CudaOutOfMemoryError(RuntimeError):
+    pass
+
+
 def env(name: str, default: str = "") -> str:
     return os.environ.get(name, default).strip()
 
@@ -81,6 +88,22 @@ def parse_fingerprint_mode(value: str) -> str:
     value = value.lower()
     if value not in {"metadata", "sha256"}:
         raise ValueError("FINGERPRINT_MODE must be metadata or sha256")
+    return value
+
+
+def parse_oom_fallback(value: str) -> str:
+    value = value.lower()
+    if value not in {"cpu", "skip", "fail"}:
+        raise ValueError("WHISPER_OOM_FALLBACK must be one of: cpu, skip, fail")
+    return value
+
+
+def parse_worker_mode(value: str) -> str:
+    value = value.lower()
+    if value in {"0", "false", "no", "off"}:
+        return "false"
+    if value not in {"always", "on_oom", "false"}:
+        raise ValueError("WHISPER_WORKER_MODE must be one of: always, on_oom, false")
     return value
 
 
@@ -293,6 +316,21 @@ def is_no_audio_error(error: BaseException) -> bool:
     return any(pattern in message for pattern in patterns)
 
 
+def is_cuda_oom_error(error: BaseException) -> bool:
+    if isinstance(error, CudaOutOfMemoryError):
+        return True
+    message = str(error).lower()
+    patterns = [
+        "cuda out of memory",
+        "outofmemoryerror",
+        "torch.cuda.outofmemoryerror",
+        "cublas_status_alloc_failed",
+        "cuda error: out of memory",
+        "unable to allocate",
+    ]
+    return any(pattern in message for pattern in patterns) and "cuda" in message
+
+
 def choose_device(requested: str) -> str:
     requested = requested.lower()
     if requested == "auto":
@@ -330,6 +368,175 @@ def parse_task(value: str) -> str:
     if value not in {"transcribe", "translate"}:
         raise ValueError("WHISPER_TASK must be transcribe or translate")
     return value
+
+
+def cleanup_runtime_memory(device: str = "") -> None:
+    gc.collect()
+    if device == "cuda" and getattr(torch, "cuda", None) is not None:
+        try:
+            torch.cuda.synchronize()
+        except Exception:
+            pass
+        try:
+            torch.cuda.empty_cache()
+        except Exception:
+            pass
+
+
+def query_nvidia_smi_memory() -> tuple[str, int | None] | None:
+    try:
+        completed = subprocess.run(
+            [
+                "nvidia-smi",
+                "--query-gpu=name,memory.total,memory.used,memory.free",
+                "--format=csv,noheader,nounits",
+            ],
+            capture_output=True,
+            text=True,
+            check=True,
+        )
+    except (FileNotFoundError, subprocess.CalledProcessError):
+        return None
+
+    first_line = next((line.strip() for line in completed.stdout.splitlines() if line.strip()), "")
+    if not first_line:
+        return None
+    parts = [part.strip() for part in first_line.split(",")]
+    free_mb = None
+    if len(parts) >= 4:
+        try:
+            free_mb = int(parts[3])
+        except ValueError:
+            free_mb = None
+    return first_line, free_mb
+
+
+def log_resource_preflight(model_name: str, device: str, fp16: bool, strict: bool) -> None:
+    print(f"Whisper preflight: model={model_name} device={device} fp16={fp16}", flush=True)
+    if device != "cuda":
+        return
+
+    gpu_memory = query_nvidia_smi_memory()
+    if gpu_memory is None:
+        print("Whisper preflight: nvidia-smi is not available inside the container.", flush=True)
+        return
+
+    raw_memory, free_mb = gpu_memory
+    print(f"Whisper preflight GPU: {raw_memory}", flush=True)
+    high_memory_models = {"medium", "large", "large-v1", "large-v2", "large-v3", "large-v3-turbo"}
+    base_model = model_name.lower().split(".", 1)[0]
+    if base_model in high_memory_models and free_mb is not None and free_mb < 5000:
+        message = (
+            f"WHISPER_MODEL={model_name} may exceed available CUDA memory "
+            f"({free_mb} MiB free). Use WHISPER_MODEL=base for reliable unattended runs."
+        )
+        if strict:
+            raise RuntimeError(message)
+        print(f"Warning: {message}", flush=True)
+
+
+def transcribe_in_process(
+    model: Any,
+    source_path: Path,
+    options: dict[str, Any],
+    local_staging: bool,
+    local_staging_dir: Path,
+) -> dict[str, Any]:
+    with transcription_source(source_path, local_staging, local_staging_dir) as source_for_transcription:
+        return model.transcribe(str(source_for_transcription), **options)
+
+
+def transcribe_worker_entry(
+    model_name: str,
+    device: str,
+    source_path: str,
+    options: dict[str, Any],
+    local_staging: bool,
+    local_staging_dir: str,
+    result_path: str,
+    error_path: str,
+) -> None:
+    try:
+        worker_model = whisper.load_model(model_name, device=device)
+        result = transcribe_in_process(
+            worker_model,
+            Path(source_path),
+            options,
+            local_staging,
+            Path(local_staging_dir),
+        )
+        atomic_write_json(Path(result_path), result)
+    except Exception as exc:
+        error_data = {
+            "error": str(exc),
+            "traceback": traceback.format_exc(),
+            "cuda_oom": is_cuda_oom_error(exc),
+        }
+        atomic_write_json(Path(error_path), error_data)
+        raise SystemExit(42 if is_cuda_oom_error(exc) else 1)
+    finally:
+        cleanup_runtime_memory(device)
+
+
+def transcribe_in_worker(
+    model_name: str,
+    device: str,
+    source_path: Path,
+    options: dict[str, Any],
+    local_staging: bool,
+    local_staging_dir: Path,
+) -> dict[str, Any]:
+    with tempfile.TemporaryDirectory(prefix="auto-whisper-worker-") as temp_dir:
+        temp_dir_path = Path(temp_dir)
+        result_path = temp_dir_path / "result.json"
+        error_path = temp_dir_path / "error.json"
+        process = multiprocessing.Process(
+            target=transcribe_worker_entry,
+            args=(
+                model_name,
+                device,
+                str(source_path),
+                options,
+                local_staging,
+                str(local_staging_dir),
+                str(result_path),
+                str(error_path),
+            ),
+        )
+        process.start()
+        process.join()
+
+        if process.exitcode == 0 and result_path.exists():
+            return json.loads(result_path.read_text(encoding="utf-8"))
+
+        error_data: dict[str, Any] = {}
+        if error_path.exists():
+            error_data = json.loads(error_path.read_text(encoding="utf-8"))
+        message = error_data.get("error") or f"Whisper worker exited with code {process.exitcode}"
+        if (
+            process.exitcode == 42
+            or (process.exitcode is not None and process.exitcode < 0)
+            or error_data.get("cuda_oom")
+            or is_cuda_oom_error(RuntimeError(message))
+        ):
+            raise CudaOutOfMemoryError(message)
+        raise RuntimeError(message)
+
+
+def transcribe_with_runtime(
+    model: Any,
+    model_name: str,
+    device: str,
+    source_path: Path,
+    options: dict[str, Any],
+    local_staging: bool,
+    local_staging_dir: Path,
+    use_worker: bool,
+) -> dict[str, Any]:
+    if use_worker:
+        print(f"Using isolated Whisper worker on {device}.", flush=True)
+        return transcribe_in_worker(model_name, device, source_path, options, local_staging, local_staging_dir)
+    return transcribe_in_process(model, source_path, options, local_staging, local_staging_dir)
 
 
 def write_outputs(result: dict[str, Any], source_path: Path, project_base: Path, formats: list[str]) -> list[Path]:
@@ -411,6 +618,29 @@ def mark_failure(
         "local_staging": local_staging,
         "error": str(error),
         "traceback": traceback.format_exc(),
+        "updated_at": datetime.now().isoformat(timespec="seconds"),
+    }
+
+
+def mark_interrupted(
+    state: dict[str, Any],
+    key: str,
+    pair_id: str,
+    fingerprint: dict[str, Any],
+    fingerprint_mode: str,
+    local_staging: bool,
+    formats: list[str],
+    error: BaseException,
+) -> None:
+    state["files"][key] = {
+        "status": "interrupted",
+        "pair_id": pair_id,
+        "fingerprint": fingerprint,
+        "fingerprint_mode": fingerprint_mode,
+        "local_staging": local_staging,
+        "formats": formats,
+        "reason": "Whisper CUDA transcription ran out of memory before outputs were completed.",
+        "error": str(error),
         "updated_at": datetime.now().isoformat(timespec="seconds"),
     }
 
@@ -619,6 +849,9 @@ def main() -> int:
     task = parse_task(env("WHISPER_TASK", "transcribe"))
     condition_on_previous_text = parse_bool(env("WHISPER_CONDITION_ON_PREVIOUS_TEXT", "true"), "WHISPER_CONDITION_ON_PREVIOUS_TEXT")
     verbose = parse_bool(env("WHISPER_VERBOSE", "false"), "WHISPER_VERBOSE")
+    oom_fallback = parse_oom_fallback(env("WHISPER_OOM_FALLBACK", "cpu"))
+    worker_mode = parse_worker_mode(env("WHISPER_WORKER_MODE", "on_oom"))
+    strict_resource_check = parse_bool(env("WHISPER_STRICT_RESOURCE_CHECK", "false"), "WHISPER_STRICT_RESOURCE_CHECK")
     fingerprint_mode = parse_fingerprint_mode(env("FINGERPRINT_MODE", "metadata"))
     local_staging = parse_bool(env("LOCAL_STAGING", "false"), "LOCAL_STAGING")
     local_staging_dir = Path(env("LOCAL_STAGING_DIR", "/tmp/auto-whisper-staging"))
@@ -640,6 +873,8 @@ def main() -> int:
         "task": task,
         "condition_on_previous_text": condition_on_previous_text,
         "verbose": verbose,
+        "oom_fallback": oom_fallback,
+        "worker_mode": worker_mode,
         "fingerprint_mode": fingerprint_mode,
         "local_staging": local_staging,
         "local_staging_dir": str(local_staging_dir) if local_staging else "",
@@ -682,11 +917,16 @@ def main() -> int:
 
     device = choose_device(env("WHISPER_DEVICE", "auto"))
     fp16 = choose_fp16(env("WHISPER_FP16", "auto"), device)
-    print(f"Loading Whisper model '{model_name}' on {device} with fp16={fp16}.", flush=True)
-    model = whisper.load_model(model_name, device=device)
+    log_resource_preflight(model_name, device, fp16, strict_resource_check)
+    model = None
+    if worker_mode != "always":
+        print(f"Loading Whisper model '{model_name}' on {device} with fp16={fp16}.", flush=True)
+        model = whisper.load_model(model_name, device=device)
 
     completed = 0
     failed = 0
+    use_worker_after_oom = False
+    stop_after_failure = False
 
     for item in pending:
 
@@ -698,8 +938,53 @@ def main() -> int:
             options["task"] = task
             options["condition_on_previous_text"] = condition_on_previous_text
             options["verbose"] = verbose
-            with transcription_source(item.source_path, local_staging, local_staging_dir) as source_for_transcription:
-                result = model.transcribe(str(source_for_transcription), **options)
+            use_worker = worker_mode == "always" or (worker_mode == "on_oom" and use_worker_after_oom)
+            try:
+                result = transcribe_with_runtime(
+                    model,
+                    model_name,
+                    device,
+                    item.source_path,
+                    options,
+                    local_staging,
+                    local_staging_dir,
+                    use_worker,
+                )
+            except Exception as exc:
+                if not is_cuda_oom_error(exc):
+                    raise
+                mark_interrupted(
+                    state,
+                    item.state_key,
+                    item.pair.id,
+                    item.fingerprint,
+                    fingerprint_mode,
+                    local_staging,
+                    formats,
+                    exc,
+                )
+                atomic_write_json(state_path, state)
+                use_worker_after_oom = True
+                cleanup_runtime_memory(device)
+                print(f"CUDA OOM during Whisper transcription: {item.pair.id}:{item.display_key}", file=sys.stderr, flush=True)
+                if oom_fallback == "fail":
+                    raise
+                if oom_fallback == "skip":
+                    failed += 1
+                    mark_failure(state, item.state_key, item.fingerprint, fingerprint_mode, local_staging, exc)
+                    continue
+
+                print(f"Retrying Whisper transcription on CPU: {item.pair.id}:{item.display_key}", flush=True)
+                cpu_options = dict(options)
+                cpu_options["fp16"] = False
+                result = transcribe_in_worker(
+                    model_name,
+                    "cpu",
+                    item.source_path,
+                    cpu_options,
+                    local_staging,
+                    local_staging_dir,
+                )
             project_outputs = write_outputs(result, item.source_path, item.output_media_path, formats)
             overall_outputs = copy_overall_outputs(
                 project_outputs,
@@ -741,12 +1026,17 @@ def main() -> int:
                 failed += 1
                 print(f"Failed: {item.pair.id}:{item.display_key}: {exc}", file=sys.stderr, flush=True)
                 mark_failure(state, item.state_key, item.fingerprint, fingerprint_mode, local_staging, exc)
+                if is_cuda_oom_error(exc) and oom_fallback == "fail":
+                    stop_after_failure = True
         finally:
+            cleanup_runtime_memory(device)
             run_id = state["active_run_ids"].get(item.pair.id)
             run_key = state_run_key(item.pair.id, run_id) if run_id else ""
             if run_key in state["runs"]:
                 state["runs"][run_key]["updated_at"] = datetime.now().isoformat(timespec="seconds")
             atomic_write_json(state_path, state)
+        if stop_after_failure:
+            break
 
     for pair in pairs:
         files = scan_files(pair.input_dir, extensions)

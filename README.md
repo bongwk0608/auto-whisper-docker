@@ -641,6 +641,8 @@ Progress is stored in `state/progress.json`, which is ignored by Git.
 
 If a run is interrupted, run Compose again. Completed files are skipped when the source fingerprint and expected outputs still match. Video-only files with no usable audio stream are recorded and skipped on later runs unless the source file changes. Failed files are recorded and retried on the next run. Each input/output pair reuses its active timestamped output folder while a run is incomplete.
 
+If a CUDA transcription process exits with a plain `Killed` line, Linux/WSL/Docker most likely stopped the process for memory pressure before Python could catch an exception. Lower `WHISPER_MODEL` to `base`, keep `WHISPER_OOM_FALLBACK=cpu`, and rerun Compose; incomplete files will be retried.
+
 By default, `FINGERPRINT_MODE=metadata` uses file size and modified timestamp for fast skip checks, which is much faster for large network-drive folders. Set `FINGERPRINT_MODE=sha256` if you want the older maximum-safety behavior that reads each supported file fully before deciding whether to skip it.
 
 `LOCAL_STAGING=false` by default, so pending media files are transcribed directly from their mounted input path. If network reads are unstable during transcription, set `LOCAL_STAGING=true`; Auto Whisper will copy only the current pending file to `LOCAL_STAGING_DIR`, transcribe that local temporary copy, and clean it up afterward. It does not cache or copy the whole input folder.
@@ -662,6 +664,9 @@ Important `.env` values:
 - `WHISPER_FP16`: `false` for CPU, `auto` for CUDA, or explicit `true`/`false`
 - `WHISPER_CONDITION_ON_PREVIOUS_TEXT`: `true` or `false`
 - `WHISPER_VERBOSE`: `true` or `false`
+- `WHISPER_OOM_FALLBACK`: `cpu` to retry CUDA OOM files on CPU, `skip` to record failure and continue, or `fail` to stop immediately
+- `WHISPER_WORKER_MODE`: `always` to isolate every transcription in a child process, `on_oom` to enable worker isolation after the first CUDA OOM, or `false` for in-process transcription
+- `WHISPER_STRICT_RESOURCE_CHECK`: `true` to stop when preflight detects risky low-VRAM settings, or `false` to warn and continue
 - `DIARIZATION_VERBOSE`: `true` for project-level pyannote progress/timing logs, or `false`
 - `DIARIZATION_PROGRESS`: empty to follow `DIARIZATION_VERBOSE`, `true` for live pyannote stage progress with percentage/ETA when available, or `false`
 - `DIARIZATION_TF32`: `false` for reproducible pyannote CUDA output, `true` for faster TF32 inference, or `auto` to leave PyTorch defaults unchanged
@@ -684,8 +689,8 @@ Important `.env` values:
 
 Recommended defaults:
 
-- CPU: `WHISPER_DEVICE=cpu`, `WHISPER_FP16=false`, `FINGERPRINT_MODE=metadata`, `LOCAL_STAGING=false`, `OVERALL_OUTPUT_ENABLED=true`, `NVIDIA_VISIBLE_DEVICES=void`
-- CUDA: `WHISPER_DEVICE=auto`, `WHISPER_FP16=auto`, `FINGERPRINT_MODE=metadata`, `LOCAL_STAGING=false`, `OVERALL_OUTPUT_ENABLED=true`, `NVIDIA_VISIBLE_DEVICES=all`
+- CPU: `WHISPER_MODEL=base`, `WHISPER_DEVICE=cpu`, `WHISPER_FP16=false`, `WHISPER_OOM_FALLBACK=cpu`, `WHISPER_WORKER_MODE=on_oom`, `FINGERPRINT_MODE=metadata`, `LOCAL_STAGING=false`, `OVERALL_OUTPUT_ENABLED=true`, `NVIDIA_VISIBLE_DEVICES=void`
+- CUDA: `WHISPER_MODEL=base`, `WHISPER_DEVICE=auto`, `WHISPER_FP16=auto`, `WHISPER_OOM_FALLBACK=cpu`, `WHISPER_WORKER_MODE=on_oom`, `FINGERPRINT_MODE=metadata`, `LOCAL_STAGING=false`, `OVERALL_OUTPUT_ENABLED=true`, `NVIDIA_VISIBLE_DEVICES=all`
 
 ## Resource Checks
 
@@ -749,9 +754,13 @@ If CUDA runs out of memory during transcription, first try:
 
 ```env
 WHISPER_MODEL=base
+WHISPER_OOM_FALLBACK=cpu
+WHISPER_WORKER_MODE=on_oom
+WHISPER_DEVICE=auto
+WHISPER_FP16=auto
 ```
 
-If it still fails, use CPU mode. CPU mode is slower but has the broadest platform compatibility.
+If WSL + Docker prints only `Killed`, restart WSL/Docker after increasing `.wslconfig` memory/swap, then rerun the pipeline. If it still fails, use CPU mode. CPU mode is slower but has the broadest platform compatibility.
 
 On Apple Silicon Macs, Docker runs Linux ARM containers. Use the CPU image and avoid the CUDA profile.
 

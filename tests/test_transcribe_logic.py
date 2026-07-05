@@ -329,6 +329,31 @@ class TranscribeLogicTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "FINGERPRINT_MODE"):
             transcribe.parse_fingerprint_mode("full")
 
+    def test_parse_whisper_oom_fallback_accepts_supported_values(self) -> None:
+        self.assertEqual(transcribe.parse_oom_fallback("cpu"), "cpu")
+        self.assertEqual(transcribe.parse_oom_fallback("skip"), "skip")
+        self.assertEqual(transcribe.parse_oom_fallback("fail"), "fail")
+
+    def test_parse_whisper_oom_fallback_rejects_unknown_values(self) -> None:
+        with self.assertRaisesRegex(ValueError, "WHISPER_OOM_FALLBACK"):
+            transcribe.parse_oom_fallback("restart")
+
+    def test_parse_whisper_worker_mode_accepts_supported_values(self) -> None:
+        self.assertEqual(transcribe.parse_worker_mode("always"), "always")
+        self.assertEqual(transcribe.parse_worker_mode("on_oom"), "on_oom")
+        self.assertEqual(transcribe.parse_worker_mode("false"), "false")
+        self.assertEqual(transcribe.parse_worker_mode("off"), "false")
+
+    def test_parse_whisper_worker_mode_rejects_unknown_values(self) -> None:
+        with self.assertRaisesRegex(ValueError, "WHISPER_WORKER_MODE"):
+            transcribe.parse_worker_mode("sometimes")
+
+    def test_cuda_oom_detection_matches_common_messages(self) -> None:
+        self.assertTrue(transcribe.is_cuda_oom_error(RuntimeError("CUDA out of memory. Tried to allocate 20 MiB")))
+        self.assertTrue(transcribe.is_cuda_oom_error(RuntimeError("torch.cuda.OutOfMemoryError: CUDA error: out of memory")))
+        self.assertTrue(transcribe.is_cuda_oom_error(transcribe.CudaOutOfMemoryError("Whisper worker exited with code -9")))
+        self.assertFalse(transcribe.is_cuda_oom_error(RuntimeError("Failed to load audio: ffmpeg decode error")))
+
     def test_metadata_fingerprint_can_match_existing_sha256_record(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             output = Path(temp_dir) / "out.txt"
@@ -442,6 +467,29 @@ class TranscribeLogicTests(unittest.TestCase):
 
             with transcribe.transcription_source(source, False, Path(temp_dir) / "staging") as path:
                 self.assertEqual(path, source)
+
+    def test_transcribe_with_runtime_uses_in_process_model(self) -> None:
+        class FakeModel:
+            def transcribe(self, path: str, **options):
+                return {"text": path, "segments": [], "fp16": options["fp16"]}
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            source = Path(temp_dir) / "audio.mp3"
+            source.write_bytes(b"audio")
+
+            result = transcribe.transcribe_with_runtime(
+                FakeModel(),
+                "base",
+                "cpu",
+                source,
+                {"fp16": False},
+                False,
+                Path(temp_dir) / "staging",
+                False,
+            )
+
+            self.assertEqual(result["text"], str(source))
+            self.assertFalse(result["fp16"])
 
 
 if __name__ == "__main__":
